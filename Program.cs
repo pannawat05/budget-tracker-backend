@@ -71,7 +71,6 @@ if (app.Environment.IsDevelopment())
 }
 
 if (!app.Environment.IsDevelopment())
-    app.UseHttpsRedirection();
 
 app.UseCors("AllowFrontend");
 
@@ -485,4 +484,5 @@ public class MyDbContext : DbContext
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
     }
+
 }
