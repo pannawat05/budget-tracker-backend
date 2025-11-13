@@ -6,26 +6,23 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.AspNetCore.Authorization;
-using DotNetEnv;
-
-// ================= LOAD .ENV =================
-Env.Load();
 
 // ================= CONFIG =================
 var builder = WebApplication.CreateBuilder(args);
 
-var dbHost = Environment.GetEnvironmentVariable("Server");
-var dbPort = Environment.GetEnvironmentVariable("Port");
-var dbUser = Environment.GetEnvironmentVariable("Id");
-var dbPass = Environment.GetEnvironmentVariable("Password");
-var dbName = Environment.GetEnvironmentVariable("Database");
+// Read from Environment Variables (works for both local .env and Render)
+var dbHost = Environment.GetEnvironmentVariable("Server") ?? "localhost";
+var dbPort = Environment.GetEnvironmentVariable("Port") ?? "5432";
+var dbUser = Environment.GetEnvironmentVariable("Id") ?? "postgres";
+var dbPass = Environment.GetEnvironmentVariable("Password") ?? "";
+var dbName = Environment.GetEnvironmentVariable("Database") ?? "postgres";
 
 var jwtKey = Environment.GetEnvironmentVariable("JWT_KEY") ?? "ThisIsMyUltraSecureJwtKey_AtLeast32CharsLong!!";
 var jwtIssuer = Environment.GetEnvironmentVariable("JWT_ISSUER") ?? "MyAppIssuer";
 
 var connectionString = $"Host={dbHost};Port={dbPort};Username={dbUser};Password={dbPass};Database={dbName};Ssl Mode=Require;Trust Server Certificate=True;";
 
-Console.WriteLine($"🔗 Using database: {connectionString}");
+Console.WriteLine($"🔗 Using database: {connectionString.Replace(dbPass, "***")}");
 
 // ================= SERVICES =================
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -44,11 +41,12 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
+// CORS - Allow all origins for production
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowFrontend", policy =>
+    options.AddDefaultPolicy(policy =>
     {
-        policy.WithOrigins("http://localhost:5173")
+        policy.AllowAnyOrigin()
               .AllowAnyHeader()
               .AllowAnyMethod();
     });
@@ -64,15 +62,15 @@ builder.Services.AddSwaggerGen();
 var app = builder.Build();
 
 // ================= MIDDLEWARE =================
-if (app.Environment.IsDevelopment())
+// Enable Swagger in all environments (for testing on Render)
+app.UseSwagger();
+app.UseSwaggerUI(c =>
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "Budget Tracker API v1");
+    c.RoutePrefix = string.Empty; // Swagger at root
+});
 
-if (!app.Environment.IsDevelopment())
-
-app.UseCors("AllowFrontend");
+app.UseCors();
 
 // Token blacklist middleware
 app.Use(async (context, next) =>
@@ -106,6 +104,14 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 // ================= ENDPOINTS =================
+
+// Health check
+app.MapGet("/health", () => Results.Ok(new 
+{ 
+    status = "healthy",
+    timestamp = DateTime.UtcNow,
+    environment = app.Environment.EnvironmentName
+}));
 
 // -------- REGISTER --------
 app.MapPost("/register", async (MyDbContext db, User user) =>
@@ -251,7 +257,6 @@ app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db,
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
     if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    // Check if category exists and belongs to user
     var category = await db.Categories.FindAsync(req.CategoryId);
     if (category == null || category.UserId != userId)
         return Results.BadRequest("Invalid category");
@@ -279,7 +284,6 @@ app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbCon
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
     if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    // Check if category exists and belongs to user
     if (!Guid.TryParse(req.CategoryId, out var categoryId))
         return Results.BadRequest("Invalid category ID");
 
@@ -319,7 +323,6 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
     if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    // ดึงข้อมูลจาก DB ก่อน (ยังไม่ format)
     var rawTransactions = await db.Transactions
         .Where(t => t.UserId == userId)
         .Join(db.Categories,
@@ -337,7 +340,6 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
         .OrderByDescending(t => t.CreatedAt)
         .ToListAsync();
 
-    // Format ใน memory หลังดึงข้อมูลเสร็จแล้ว
     var transactions = rawTransactions.Select(t => new
     {
         id = t.Id.ToString(),
@@ -351,6 +353,7 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
     return Results.Ok(transactions);
 }).RequireAuthorization();
 
+Console.WriteLine("✅ Application configured successfully");
 app.Run();
 
 // ================= MODELS =================
@@ -484,5 +487,4 @@ public class MyDbContext : DbContext
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
     }
-
 }
