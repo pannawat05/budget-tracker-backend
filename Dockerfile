@@ -1,17 +1,22 @@
-# Build stage
+# ===== BUILD STAGE =====
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
-WORKDIR /app
+WORKDIR /src
 
-COPY *.csproj .
+# Copy and restore
+COPY server.csproj .
 RUN dotnet restore
 
+# Copy everything else and build
 COPY . .
-RUN dotnet publish -c Release -o out
+RUN dotnet publish -c Release -o /app/publish
 
-# Runtime stage
-FROM mcr.microsoft.com/dotnet/aspnet:8.0
+# ===== RUNTIME STAGE =====
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 WORKDIR /app
-COPY --from=build /app/out .
-ENTRYPOINT ["dotnet", "YourApp.dll"]
+COPY --from=build /app/publish .
 
+# Run the app
+ENTRYPOINT ["dotnet", "server.dll"]
+
+# Expose port
 EXPOSE 8080
