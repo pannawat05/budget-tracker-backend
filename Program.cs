@@ -6,13 +6,12 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.AspNetCore.Authorization;
-using DotNetEnv; // คุณมีอยู่แล้ว
+using DotNetEnv;
 
 // ================= CONFIG =================
 var builder = WebApplication.CreateBuilder(args);
 
 // --- 1. โหลด .env เฉพาะตอน Development เท่านั้น ---
-// บน Render เราจะใช้ Environment Variables ของระบบ
 if (builder.Environment.IsDevelopment())
 {
     Env.Load();
@@ -31,7 +30,6 @@ var jwtIssuer = Environment.GetEnvironmentVariable("JWT_ISSUER") ?? "MyAppIssuer
 
 var connectionString = $"Host={dbHost};Port={dbPort};Username={dbUser};Password={dbPass};Database={dbName};Ssl Mode=Require;Trust Server Certificate=True;";
 
-// เราจะซ่อน Password จาก Log เสมอ
 Console.WriteLine($"🔗 Using database: Host={dbHost};Port={dbPort};Database={dbName}");
 
 // ================= SERVICES =================
@@ -52,8 +50,6 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 builder.Services.AddAuthorization();
 
 // --- 2. ตั้งค่า CORS แบบ Dynamic สำหรับ Production ---
-// อ่าน URL ของ Frontend จาก Env Var
-// ถ้าไม่ตั้งค่า (บนเครื่อง) ให้ใช้ localhost
 var frontendOrigin = Environment.GetEnvironmentVariable("FRONTEND_ORIGIN") ?? "http://localhost:5173";
 Console.WriteLine($"CORS: Allowing origin: {frontendOrigin}");
 
@@ -61,7 +57,7 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins(frontendOrigin) // ใช้ตัวแปร
+        policy.WithOrigins(frontendOrigin)
               .AllowAnyHeader()
               .AllowAnyMethod();
     });
@@ -77,23 +73,21 @@ builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
-// --- 3. รัน Migration อัตโนมัติ (สำคัญมากสำหรับ Docker/Render) ---
-// ส่วนนี้จะสร้างตารางให้เราอัตโนมัติตอนที่แอปเริ่มทำงาน
+// --- 3. รัน Migration อัตโนมัติ ---
+// (ส่วนนี้จะยังคงอยู่ แต่ตอนนี้มันจะแค่ "ยืนยัน" ว่าตารางตรงกัน)
 Console.WriteLine("Applying database migrations...");
 try
 {
     using (var scope = app.Services.CreateScope())
     {
         var dbContext = scope.ServiceProvider.GetRequiredService<MyDbContext>();
-        dbContext.Database.Migrate(); // รัน Migration ที่ค้างอยู่ทั้งหมด
+        dbContext.Database.Migrate(); 
     }
     Console.WriteLine("Migrations applied successfully.");
 }
 catch (Exception ex)
 {
-    // ถ้า Migration พัง แอปจะแจ้ง Error ชัดเจนใน Log
     Console.WriteLine($"❌ Error applying migrations: {ex.Message}");
-    // ใน Production จริง อาจจะต้องหยุดแอปไปเลยถ้า Migration พัง
 }
 
 // ================= MIDDLEWARE =================
@@ -108,9 +102,9 @@ if (!app.Environment.IsDevelopment())
     app.UseHttpsRedirection();
 }
 
-app.UseCors("AllowFrontend"); // ใช้ Policy ที่เราตั้งชื่อไว้
+app.UseCors("AllowFrontend"); 
 
-// Token blacklist middleware (โค้ดเดิมของคุณ ดีอยู่แล้ว)
+// Token blacklist middleware
 app.Use(async (context, next) =>
 {
     var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
@@ -164,7 +158,6 @@ app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 {
     var user = await db.Users.FirstOrDefaultAsync(u => u.Email == req.Email);
 
-    // 👇👇👇 บรรทัดที่แก้ไข Typo ครับ 👇👇👇
     if (user == null || !BCrypt.Net.BCrypt.Verify(req.Password, user.Password))
         return Results.Unauthorized();
 
@@ -232,14 +225,12 @@ app.MapGet("/profile", [Authorize] async (ClaimsPrincipal user, MyDbContext db) 
     return Results.Ok(new { profile.Id, profile.Email, profile.CreatedAt });
 });
 
-// -------- CATEGORIES --------
-app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
+// -------- CATEGORIES (แก้ไขแล้ว) --------
+app.MapGet("/categories", [Authorize] async (MyDbContext db) =>
 {
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
-
+    // 🚨 คำเตือน: ตอนนี้ Categories จะกลายเป็น "ของส่วนกลาง"
+    // ทุก User จะเห็น Category ทั้งหมดในระบบ
     var categories = await db.Categories
-        .Where(c => c.UserId == userId)
         .OrderBy(c => c.Name)
         .Select(c => new { c.Id, c.Name })
         .ToListAsync();
@@ -247,19 +238,13 @@ app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext d
     return Results.Ok(categories);
 }).RequireAuthorization();
 
-app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db, CategoryRequest req) =>
+app.MapPost("/categories", [Authorize] async (MyDbContext db, CategoryRequest req) =>
 {
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
-
+    // 🚨 เราไม่ได้ผูกกับ User ID แล้ว
     var category = new Category
     {
         Id = Guid.NewGuid(),
-        UserId = userId,
         Name = req.Name,
-        Type = req.Type,
-        Icon = req.Icon,
-        Color = req.Color,
         CreatedAt = DateTime.UtcNow
     };
 
@@ -270,6 +255,9 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
 }).RequireAuthorization();
 
 // -------- BUDGETS --------
+// 🚨 คำเตือน: Endpoint นี้จะยังทำงานไม่ได้
+// เพราะ Model `Budget` ยังอ้างอิง `UserId` และ `CategoryId` ที่ซับซ้อน
+// และตาราง `budgets` ใน ERD ก็ไม่มีคอลัมน์ `user_id`
 app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
@@ -289,9 +277,9 @@ app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db,
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
     if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    // Check if category exists and belongs to user
+    // 🚨 การเช็คนี้อาจจะไม่ทำงานตามที่คิด
     var category = await db.Categories.FindAsync(req.CategoryId);
-    if (category == null || category.UserId != userId)
+    if (category == null) // เราเช็ค `category.UserId` ไม่ได้แล้ว
         return Results.BadRequest("Invalid category");
 
     var budget = new Budget
@@ -317,12 +305,12 @@ app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbCon
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
     if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    // Check if category exists and belongs to user
     if (!Guid.TryParse(req.CategoryId, out var categoryId))
         return Results.BadRequest("Invalid category ID");
 
+    // 🚨 การเช็คนี้อาจจะไม่ทำงานตามที่คิด
     var category = await db.Categories.FindAsync(categoryId);
-    if (category == null || category.UserId != userId)
+    if (category == null) // เราเช็ค `category.UserId` ไม่ได้แล้ว
         return Results.BadRequest("Invalid category");
 
     var transaction = new Transaction
@@ -357,7 +345,6 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
     if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    // ดึงข้อมูลจาก DB ก่อน (ยังไม่ format)
     var rawTransactions = await db.Transactions
         .Where(t => t.UserId == userId)
         .Join(db.Categories,
@@ -375,14 +362,13 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
         .OrderByDescending(t => t.CreatedAt)
         .ToListAsync();
 
-    // Format ใน memory หลังดึงข้อมูลเสร็จแล้ว
     var transactions = rawTransactions.Select(t => new
     {
         id = t.Id.ToString(),
         amount = t.Amount,
         type = t.Type,
         note = t.Note,
-        createdAt = t.CreatedAt.ToString("o"), // "o" คือ ISO 8601 format
+        createdAt = t.CreatedAt.ToString("o"),
         categoryName = t.CategoryName
     });
 
@@ -407,25 +393,30 @@ public class User
     public DateTime CreatedAt { get; set; }
 }
 
+// --- Model `Category` (แก้ไขแล้ว) ---
 public class Category
 {
     public Guid Id { get; set; }
-    public Guid UserId { get; set; }
+    // public Guid UserId { get; set; } // ลบแล้ว
     public string Name { get; set; } = null!;
-    public string Type { get; set; } = null!;
-    public string? Icon { get; set; }
-    public string? Color { get; set; }
+    // public string Type { get; set; } = null!; // ลบแล้ว
+    // public string? Icon { get; set; } // ลบแล้ว
+    // public string? Color { get; set; } // ลบแล้ว
     public DateTime CreatedAt { get; set; }
 }
 
+// --- Model `CategoryRequest` (แก้ไขแล้ว) ---
 public class CategoryRequest
 {
     public string Name { get; set; } = null!;
-    public string Type { get; set; } = null!;
-    public string? Icon { get; set; }
-    public string? Color { get; set; }
+    // public string Type { get; set; } = null!; // ลบแล้ว
+    // public string? Icon { get; set; } // ลบแล้ว
+    // public string? Color { get; set; } // ลบแล้ว
 }
 
+// 🚨 คำเตือน: Model `Budget` และ `Transaction` ยังคงอ้างอิง `UserId`
+// แต่ ERD ของคุณในตาราง `budgets` และ `transactions` ก็ไม่ได้แสดง `user_id`
+// นี่อาจจะเป็นปัญหาถัดไปที่คุณจะเจอครับ
 public class Budget
 {
     public Guid Id { get; set; }
@@ -484,22 +475,26 @@ public class MyDbContext : DbContext
             entity.ToTable("users");
             entity.Property(e => e.Id).HasColumnName("id");
             entity.Property(e => e.Email).HasColumnName("email");
-            entity.Property(e => e.Password).HasColumnName("password_hash");
+            entity.Property(e => e.Password).HasColumnName("password_hash"); 
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
 
+        // --- `OnModelCreating` สำหรับ `Category` (แก้ไขแล้ว) ---
         modelBuilder.Entity<Category>(entity =>
         {
             entity.ToTable("categories");
             entity.Property(e => e.Id).HasColumnName("id");
-            entity.Property(e => e.UserId).HasColumnName("user_id");
+            // entity.Property(e => e.UserId).HasColumnName("user_id"); // ลบแล้ว
             entity.Property(e => e.Name).HasColumnName("name");
-            entity.Property(e => e.Type).HasColumnName("type");
-            entity.Property(e => e.Icon).HasColumnName("icon");
-            entity.Property(e => e.Color).HasColumnName("color");
+            // entity.Property(e => e.Type).HasColumnName("type"); // ลบแล้ว
+            // entity.Property(e => e.Icon).HasColumnName("icon"); // ลบแล้ว
+            // entity.Property(e => e.Color).HasColumnName("color"); // ลบแล้ว
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
 
+        // 🚨 คำเตือน: ตาราง `budgets` และ `transactions` ใน ERD ของคุณ
+        // ไม่มี `user_id` และ `category_id` ซึ่งโค้ด C# นี้ยังคงอ้างอิงอยู่
+        // นี่อาจเป็น Error ต่อไปที่คุณจะเจอครับ
         modelBuilder.Entity<Budget>(entity =>
         {
             entity.ToTable("budgets");
@@ -525,4 +520,3 @@ public class MyDbContext : DbContext
         });
     }
 }
-
