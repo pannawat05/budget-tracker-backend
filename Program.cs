@@ -41,19 +41,14 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
-// ================= CORS =================
-// สำหรับ React frontend และ production
+// CORS
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("BudgetAppCors", policy =>
+    options.AddDefaultPolicy(policy =>
     {
-        policy.WithOrigins(
-            "http://localhost:5173",              // Dev React
-            "https://YOUR_PRODUCTION_FRONTEND_URL" // Production frontend
-        )
-        .AllowAnyHeader()
-        .AllowAnyMethod()
-        .AllowCredentials(); // จำเป็นเมื่อใช้ Authorization header
+        policy.AllowAnyOrigin()
+              .AllowAnyHeader()
+              .AllowAnyMethod();
     });
 });
 
@@ -71,12 +66,11 @@ app.UseSwagger();
 app.UseSwaggerUI(c =>
 {
     c.SwaggerEndpoint("/swagger/v1/swagger.json", "Budget Tracker API v1");
-    c.RoutePrefix = string.Empty; // Swagger at root
+    c.RoutePrefix = string.Empty;
 });
 
-app.UseCors("BudgetAppCors");
+app.UseCors();
 
-// Token blacklist middleware
 app.Use(async (context, next) =>
 {
     var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
@@ -98,7 +92,7 @@ app.Use(async (context, next) =>
                 return;
             }
         }
-        catch { /* ignore invalid token, let JWT middleware handle */ }
+        catch { }
     }
 
     await next();
@@ -190,7 +184,7 @@ app.MapPost("/logout", [Authorize] async (HttpContext context, IMemoryCache cach
     {
         return Results.Problem($"Error during logout: {ex.Message}", statusCode: 500);
     }
-});
+}).RequireAuthorization();
 
 // -------- PROFILE --------
 app.MapGet("/profile", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
@@ -202,7 +196,7 @@ app.MapGet("/profile", [Authorize] async (ClaimsPrincipal user, MyDbContext db) 
     if (profile == null) return Results.NotFound();
 
     return Results.Ok(new { profile.Id, profile.Email, profile.CreatedAt });
-});
+}).RequireAuthorization();
 
 // -------- CATEGORIES --------
 app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
@@ -213,11 +207,18 @@ app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext d
     var categories = await db.Categories
         .Where(c => c.UserId == userId)
         .OrderBy(c => c.Name)
-        .Select(c => new { c.Id, c.Name })
+        .Select(c => new
+        {
+            c.Id,
+            c.Name,
+            Type = c.Type ?? "",
+            Icon = c.Icon ?? "",
+            Color = c.Color ?? ""
+        })
         .ToListAsync();
 
     return Results.Ok(categories);
-});
+}).RequireAuthorization();
 
 app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db, CategoryRequest req) =>
 {
@@ -239,48 +240,7 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
     await db.SaveChangesAsync();
 
     return Results.Ok(new { message = "Category created successfully", category = new { category.Id, category.Name } });
-});
-
-// -------- BUDGETS --------
-app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
-{
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
-
-    var budgets = await db.Budgets
-        .Where(b => b.UserId == userId)
-        .OrderByDescending(b => b.Year)
-        .ThenByDescending(b => b.Month)
-        .ToListAsync();
-
-    return Results.Ok(budgets);
-});
-
-app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db, BudgetRequest req) =>
-{
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
-
-    var category = await db.Categories.FindAsync(req.CategoryId);
-    if (category == null || category.UserId != userId)
-        return Results.BadRequest("Invalid category");
-
-    var budget = new Budget
-    {
-        Id = Guid.NewGuid(),
-        UserId = userId,
-        CategoryId = req.CategoryId,
-        Month = req.Month,
-        Year = req.Year,
-        LimitAmount = req.LimitAmount,
-        CreatedAt = DateTime.UtcNow
-    };
-
-    db.Budgets.Add(budget);
-    await db.SaveChangesAsync();
-
-    return Results.Ok(new { message = "Budget created successfully", budget });
-});
+}).RequireAuthorization();
 
 // -------- TRANSACTIONS --------
 app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbContext db, TransactionRequest req) =>
@@ -313,14 +273,14 @@ app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbCon
     {
         id = transaction.Id.ToString(),
         amount = transaction.Amount,
-        type = transaction.Type,
-        note = transaction.Note,
+        type = transaction.Type ?? "",
+        note = transaction.Note ?? "",
         createdAt = transaction.CreatedAt.ToString("o"),
         categoryName = category.Name
     };
 
     return Results.Ok(new { message = "Transaction added successfully", transaction = response });
-});
+}).RequireAuthorization();
 
 app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
@@ -336,26 +296,117 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
             {
                 t.Id,
                 t.Amount,
-                t.Type,
-                t.Note,
+                Type = t.Type ?? "",
+                Note = t.Note ?? "",
                 t.CreatedAt,
                 CategoryName = c.Name
             })
         .OrderByDescending(t => t.CreatedAt)
         .ToListAsync();
 
-    var transactions = rawTransactions.Select(t => new
-    {
-        id = t.Id.ToString(),
-        amount = t.Amount,
-        type = t.Type,
-        note = t.Note,
-        createdAt = t.CreatedAt.ToString("o"),
-        categoryName = t.CategoryName
-    });
-
-    return Results.Ok(transactions);
-});
+    return Results.Ok(rawTransactions);
+}).RequireAuthorization();
 
 Console.WriteLine("✅ Application configured successfully");
 app.Run();
+
+// ================= MODELS =================
+public class LoginRequest
+{
+    public string Email { get; set; } = null!;
+    public string Password { get; set; } = null!;
+}
+
+public class User
+{
+    public Guid Id { get; set; }
+    public string Email { get; set; } = null!;
+    public string Password { get; set; } = null!;
+    public DateTime CreatedAt { get; set; }
+}
+
+public class Category
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public string Name { get; set; } = null!;
+    public string? Type { get; set; }
+    public string? Icon { get; set; }
+    public string? Color { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class CategoryRequest
+{
+    public string Name { get; set; } = null!;
+    public string? Type { get; set; }
+    public string? Icon { get; set; }
+    public string? Color { get; set; }
+}
+
+public class Transaction
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public Guid CategoryId { get; set; }
+    public decimal Amount { get; set; }
+    public string? Type { get; set; }
+    public string? Note { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class TransactionRequest
+{
+    public string CategoryId { get; set; } = null!;
+    public decimal Amount { get; set; }
+    public string? Type { get; set; }
+    public string? Note { get; set; }
+}
+
+// ================= DB CONTEXT =================
+public class MyDbContext : DbContext
+{
+    public MyDbContext(DbContextOptions<MyDbContext> options) : base(options) { }
+
+    public DbSet<User> Users { get; set; } = null!;
+    public DbSet<Category> Categories { get; set; } = null!;
+    public DbSet<Transaction> Transactions { get; set; } = null!;
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+
+        modelBuilder.Entity<User>(entity =>
+        {
+            entity.ToTable("users");
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.Email).HasColumnName("email");
+            entity.Property(e => e.Password).HasColumnName("password_hash");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+
+        modelBuilder.Entity<Category>(entity =>
+        {
+            entity.ToTable("categories");
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.UserId).HasColumnName("user_id");
+            entity.Property(e => e.Name).HasColumnName("name");
+            entity.Property(e => e.Type).HasColumnName("type");
+            entity.Property(e => e.Icon).HasColumnName("icon");
+            entity.Property(e => e.Color).HasColumnName("color");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+
+        modelBuilder.Entity<Transaction>(entity =>
+        {
+            entity.ToTable("transactions");
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.UserId).HasColumnName("user_id");
+            entity.Property(e => e.CategoryId).HasColumnName("category_id");
+            entity.Property(e => e.Amount).HasColumnName("amount");
+            entity.Property(e => e.Type).HasColumnName("type");
+            entity.Property(e => e.Note).HasColumnName("note");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+    }
+}
