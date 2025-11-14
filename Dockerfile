@@ -8,12 +8,11 @@ RUN dotnet restore
 
 # คัดลอกโค้ดที่เหลือและ Build
 COPY . .
-
-### 👇 ผมแก้ไขบรรทัดนี้ครับ 👇 ###
 RUN dotnet publish "server.csproj" -c Release -o /app/out
 
 ### 1. ติดตั้ง EF Tools ไว้ในโฟลเดอร์แยก ###
-RUN dotnet tool install --global dotnet-ef --tool-path /tools
+### 👇 ผมแก้ไขบรรทัดนี้ครับ (ลบ --global) 👇 ###
+RUN dotnet tool install dotnet-ef --tool-path /tools
 
 
 # --- Final Stage (ใช้ ASP.NET Runtime) ---
