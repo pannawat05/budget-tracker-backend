@@ -142,8 +142,7 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 // ================= ENDPOINTS =================
-// (โค้ด Endpoints ทั้งหมดของคุณ... ไม่ต้องแก้ไข)
-// ...
+
 // -------- REGISTER --------
 app.MapPost("/register", async (MyDbContext db, User user) =>
 {
@@ -164,7 +163,9 @@ app.MapPost("/register", async (MyDbContext db, User user) =>
 app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 {
     var user = await db.Users.FirstOrDefaultAsync(u => u.Email == req.Email);
-    if (user == null || !BCRypNet.BCrypt.Verify(req.Password, user.Password))
+
+    // 👇👇👇 บรรทัดที่แก้ไข Typo ครับ 👇👇👇
+    if (user == null || !BCrypt.Net.BCrypt.Verify(req.Password, user.Password))
         return Results.Unauthorized();
 
     var handler = new JwtSecurityTokenHandler();
@@ -392,8 +393,6 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
 app.Run();
 
 // ================= MODELS =================
-// (โค้ด Models ทั้งหมดของคุณ... ไม่ต้องแก้ไข)
-// ...
 public class LoginRequest
 {
     public string Email { get; set; } = null!;
@@ -467,8 +466,6 @@ public class Transaction
 
 
 // ================= DB CONTEXT =================
-// (โค้ด DbContext ของคุณ... ไม่ต้องแก้ไข)
-// การแมพชื่อคอลัมน์ด้วยมือแบบนี้ดีมากครับ!
 public class MyDbContext : DbContext
 {
     public MyDbContext(DbContextOptions<MyDbContext> options) : base(options) { }
@@ -487,9 +484,8 @@ public class MyDbContext : DbContext
             entity.ToTable("users");
             entity.Property(e => e.Id).HasColumnName("id");
             entity.Property(e => e.Email).HasColumnName("email");
-            // แก้ไขเล็กน้อย: ให้ตรงกับฐานข้อมูล Supabase Auth ที่คนนิยมใช้
-            // แต่ถ้าคุณสร้างเอง "password_hash" ก็ถูกต้องครับ
-            entity.Property(e => e.Password).HasColumnName("password_hash"); 
+            entity.Property(e => e.Password).HasColumnName("password_hash");
+Such as.
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
 
