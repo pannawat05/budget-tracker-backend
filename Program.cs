@@ -114,6 +114,41 @@ app.MapGet("/health", () => Results.Ok(new
     environment = app.Environment.EnvironmentName
 }));
 
+// Fix categories with null type
+app.MapPost("/fix-categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
+{
+    try
+    {
+        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!Guid.TryParse(idStr, out var userId)) 
+            return Results.Problem("Invalid user ID", statusCode: 401);
+
+        // Update all categories for this user where type is null
+        var categoriesToFix = await db.Categories
+            .Where(c => c.UserId == userId && c.Type == null)
+            .ToListAsync();
+
+        foreach (var category in categoriesToFix)
+        {
+            category.Type = "expense"; // Set default type
+        }
+
+        await db.SaveChangesAsync();
+
+        return Results.Ok(new 
+        { 
+            message = "Categories fixed", 
+            updated = categoriesToFix.Count,
+            categories = categoriesToFix.Select(c => new { c.Id, c.Name, c.Type })
+        });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Fix categories error: {ex.Message}");
+        return Results.Problem($"Error: {ex.Message}", statusCode: 500);
+    }
+}).RequireAuthorization();
+
 // -------- REGISTER --------
 app.MapPost("/register", async (MyDbContext db, User user) =>
 {
@@ -261,7 +296,7 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
             Id = Guid.NewGuid(),
             UserId = userId,
             Name = req.Name,
-            Type = req.Type,
+            Type = req.Type ?? "expense", // ✅ ให้ default value
             Icon = req.Icon,
             Color = req.Color,
             CreatedAt = DateTime.UtcNow
@@ -468,7 +503,7 @@ public class Category
     public Guid Id { get; set; }
     public Guid UserId { get; set; }
     public string Name { get; set; } = null!;
-    public string Type { get; set; } = null!;
+    public string? Type { get; set; } // ✅ เปลี่ยนเป็น nullable
     public string? Icon { get; set; }
     public string? Color { get; set; }
     public DateTime CreatedAt { get; set; }
@@ -477,7 +512,7 @@ public class Category
 public class CategoryRequest
 {
     public string Name { get; set; } = null!;
-    public string Type { get; set; } = null!;
+    public string? Type { get; set; } // ✅ เปลี่ยนเป็น nullable
     public string? Icon { get; set; }
     public string? Color { get; set; }
 }
