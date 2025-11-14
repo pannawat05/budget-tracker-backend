@@ -123,23 +123,23 @@ app.MapPost("/fix-categories", [Authorize] async (ClaimsPrincipal user, MyDbCont
         if (!Guid.TryParse(idStr, out var userId)) 
             return Results.Problem("Invalid user ID", statusCode: 401);
 
-        // Update all categories for this user where type is null
-        var categoriesToFix = await db.Categories
-            .Where(c => c.UserId == userId && c.Type == null)
+        // ใช้ raw SQL เพราะ EF Core ไม่สามารถ query categories ที่ user_id เป็น null ได้
+        var fixedCount = await db.Database.ExecuteSqlRawAsync(
+            $"UPDATE categories SET user_id = '{userId}', type = COALESCE(type, 'expense') WHERE user_id IS NULL"
+        );
+
+        // ดึงข้อมูลที่แก้ไขแล้ว
+        var categories = await db.Categories
+            .Where(c => c.UserId == userId)
+            .Select(c => new { c.Id, c.Name, c.Type, c.UserId })
             .ToListAsync();
-
-        foreach (var category in categoriesToFix)
-        {
-            category.Type = "expense"; // Set default type
-        }
-
-        await db.SaveChangesAsync();
 
         return Results.Ok(new 
         { 
-            message = "Categories fixed", 
-            updated = categoriesToFix.Count,
-            categories = categoriesToFix.Select(c => new { c.Id, c.Name, c.Type })
+            message = "Categories fixed successfully", 
+            updated = fixedCount,
+            totalCategories = categories.Count,
+            categories = categories
         });
     }
     catch (Exception ex)
