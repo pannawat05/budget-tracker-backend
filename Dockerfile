@@ -1,27 +1,33 @@
-# ===== BUILD STAGE =====
+# --- Build Stage (ใช้ SDK) ---
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
-# Copy and restore
-COPY server.csproj .
+# คัดลอก .csproj และ restore
+COPY *.csproj .
 RUN dotnet restore
 
-# Copy everything else and build
+# คัดลอกโค้ดที่เหลือและ Build
 COPY . .
-RUN dotnet publish -c Release -o /app/publish
+RUN dotnet publish "YourApiProjectName.csproj" -c Release -o /app/out
 
-# ===== RUNTIME STAGE =====
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+### 1. ติดตั้ง EF Tools ไว้ในโฟลเดอร์แยก ###
+RUN dotnet tool install --global dotnet-ef --tool-path /tools
+
+
+# --- Final Stage (ใช้ ASP.NET Runtime) ---
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app
+COPY --from=build /app/out .
 
-# **สำคัญ: ต้องมี ENV variables เหล่านี้**
-ENV ASPNETCORE_URLS=http://+:8080
-ENV ASPNETCORE_ENVIRONMENT=Production
+### 2. คัดลอก EF Tools ที่ติดตั้งไว้มาใส่ใน Image สุดท้าย ###
+COPY --from=build /tools /tools
+ENV PATH="$PATH:/tools"
 
-# Expose port ต้องอยู่ก่อน COPY
-EXPOSE 8080
+### 3. คัดลอก Entrypoint Script และทำให้มันทำงานได้ ###
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
-COPY --from=build /app/publish .
-
-# Run the app
-ENTRYPOINT ["dotnet", "server.dll"]
+### 4. ตั้งค่าให้ Entrypoint ชี้ไปที่สคริปต์ของเรา ###
+# และ CMD คือคำสั่งปกติที่จะถูกส่งไปให้สคริปต์
+ENTRYPOINT ["/bin/bash", "entrypoint.sh"]
+CMD ["dotnet", "server.dll"]
