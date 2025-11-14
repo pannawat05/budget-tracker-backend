@@ -8,7 +8,9 @@ RUN dotnet restore
 
 # คัดลอกโค้ดที่เหลือและ Build
 COPY . .
-RUN dotnet publish "YourApiProjectName.csproj" -c Release -o /app/out
+
+### 👇 ผมแก้ไขบรรทัดนี้ครับ 👇 ###
+RUN dotnet publish "server.csproj" -c Release -o /app/out
 
 ### 1. ติดตั้ง EF Tools ไว้ในโฟลเดอร์แยก ###
 RUN dotnet tool install --global dotnet-ef --tool-path /tools
