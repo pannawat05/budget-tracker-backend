@@ -485,7 +485,6 @@ public class MyDbContext : DbContext
             entity.Property(e => e.Id).HasColumnName("id");
             entity.Property(e => e.Email).HasColumnName("email");
             entity.Property(e => e.Password).HasColumnName("password_hash");
-Such as.
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
 
@@ -526,3 +525,4 @@ Such as.
         });
     }
 }
+
