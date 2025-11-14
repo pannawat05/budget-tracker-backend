@@ -5,7 +5,7 @@ using System.Text;
 var builder = WebApplication.CreateBuilder(args);
 
 // -------------------------------------------------
-//  CORS — อนุญาต React (localhost:5173) และ Render 
+// 1) CORS — แก้ปัญหา React (5173) เรียกไม่ได้ / Render 500
 // -------------------------------------------------
 builder.Services.AddCors(options =>
 {
@@ -22,12 +22,12 @@ builder.Services.AddCors(options =>
 });
 
 // -------------------------------------------------
-//  Controllers
+// 2) Controllers (ทำให้ endpoint เดิมทั้งหมดยังทำงาน)
 // -------------------------------------------------
 builder.Services.AddControllers();
 
 // -------------------------------------------------
-//  Authentication (ถ้ามี)
+// 3) Authentication (ถ้าโปรเจกต์มี JWT)
 // -------------------------------------------------
 var jwtKey = builder.Configuration["Jwt:Key"];
 var jwtIssuer = builder.Configuration["Jwt:Issuer"];
@@ -48,15 +48,22 @@ if (!string.IsNullOrEmpty(jwtKey))
         });
 }
 
+// -------------------------------------------------
+// Build app
+// -------------------------------------------------
 var app = builder.Build();
 
 // -------------------------------------------------
-//  Middleware ลำดับสำคัญมาก! 
+// 4) Middlewares — ลำดับสำคัญมาก (แก้ 500 CORS กรณีคุณเจอ)
 // -------------------------------------------------
-app.UseCors("AllowFrontend");  // ต้องมาก่อน Auth + Controllers
+app.UseCors("AllowFrontend");   // ต้องมาก่อน Authentication + Controllers
 app.UseAuthentication();
 app.UseAuthorization();
 
-app.MapControllers();
+// -------------------------------------------------
+// 5) Endpoint เดิมทั้งหมดจะทำงานจากไฟล์ Controller
+// -------------------------------------------------
+app.MapControllers();  
 
+// -------------------------------------------------
 app.Run();
