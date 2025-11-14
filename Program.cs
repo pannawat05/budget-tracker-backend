@@ -1,4 +1,11 @@
+using System;
+using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.EntityFrameworkCore;
@@ -6,6 +13,8 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration; // เพิ่ม Using นี้เผื่อ Environment Variables
 
 // ================= CONFIG =================
 var builder = WebApplication.CreateBuilder(args);
@@ -59,9 +68,13 @@ builder.Services.AddMemoryCache();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// เพิ่มบรรทัดนี้เพื่อเปิดใช้งาน Routing
+builder.Services.AddRouting();
+
 var app = builder.Build();
 
 // ================= MIDDLEWARE =================
+// 1. Swagger (ควรอยู่บนสุดสำหรับ Development)
 app.UseSwagger();
 app.UseSwaggerUI(c =>
 {
@@ -69,40 +82,45 @@ app.UseSwaggerUI(c =>
     c.RoutePrefix = string.Empty;
 });
 
+// 2. เพิ่ม UseRouting()
+// ทำให้ Middleware ที่มาทีหลัง (เช่น Cors, Auth) รู้ว่ากำลังจะเรียก Endpoint ไหน
+app.UseRouting();
+
+// 3. ย้าย UseCors() มาไว้หลัง UseRouting() และก่อน Auth
 app.UseCors();
 
-// Token blacklist middleware
-app.Use(async (context, next) =>
-{
-    var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
-    var authHeader = context.Request.Headers["Authorization"].ToString();
-
-    if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
-    {
-        var token = authHeader.Substring(7);
-        try
-        {
-            var handler = new JwtSecurityTokenHandler();
-            var jwt = handler.ReadJwtToken(token);
-            var jti = jwt.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
-
-            if (!string.IsNullOrEmpty(jti) && cache.TryGetValue($"blacklist_{jti}", out _))
-            {
-                context.Response.StatusCode = 401;
-                await context.Response.WriteAsJsonAsync(new { error = "Token has been revoked" });
-                return;
-            }
-        }
-        catch { }
-    }
-
-    await next();
-});
-
+// 4. Auth Middleware
 app.UseAuthentication();
 app.UseAuthorization();
 
+// 5. ย้าย Token blacklist middleware มาไว้หลัง Auth ทั้งหมด
+//    และเปลี่ยนมาเช็คจาก context.User ที่ผ่านการ Validate แล้ว
+app.Use(async (context, next) =>
+{
+    // ตรวจสอบว่า User ผ่านการยืนยันตัวตนมาแล้วหรือยัง
+    if (context.User.Identity?.IsAuthenticated == true)
+    {
+        var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
+        
+        // ดึง jti จาก Claims ที่ผ่านการ Validate แล้ว (ไม่ต้อง Parse Token เอง)
+        var jti = context.User.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
+
+        if (!string.IsNullOrEmpty(jti) && cache.TryGetValue($"blacklist_{jti}", out _))
+        {
+            // ถ้า Token อยู่ใน Blacklist ให้ส่ง 401
+            context.Response.StatusCode = 401;
+            await context.Response.WriteAsJsonAsync(new { error = "Token has been revoked" });
+            return;
+        }
+    }
+
+    // ถ้าไม่ติด Blacklist (หรือไม่ได้ Login) ก็ไปต่อ
+    await next();
+});
+
+
 // ================= ENDPOINTS =================
+// (Endpoints ทั้งหมดของคุณจะถูก Map โดยอัตโนมัติ)
 
 // Health check
 app.MapGet("/health", () => Results.Ok(new
@@ -144,7 +162,7 @@ app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
         {
             new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
             new Claim(ClaimTypes.Email, user.Email),
-            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()) // JTI สำหรับ Blacklist
         }),
         Expires = DateTime.UtcNow.AddHours(2),
         Issuer = jwtIssuer,
@@ -160,32 +178,28 @@ app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 });
 
 // -------- LOGOUT --------
-app.MapPost("/logout", async (HttpContext context, IMemoryCache cache) =>
+// [Authorize] ทำงานร่วมกับ Blacklist Middleware ที่เราย้ายไป
+app.MapPost("/logout", [Authorize] async (ClaimsPrincipal user, IMemoryCache cache) =>
 {
-    var authHeader = context.Request.Headers["Authorization"].ToString();
-    if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
-        return Results.BadRequest(new { error = "No token provided" });
+    // ไม่ต้อง Parse Token เองแล้ว ดึงจาก ClaimsPrincipal (user) ได้เลย
+    var jti = user.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
+    if (string.IsNullOrEmpty(jti)) 
+        return Results.BadRequest(new { error = "Invalid token (missing jti)" });
 
-    var token = authHeader.Substring(7);
-    try
-    {
-        var handler = new JwtSecurityTokenHandler();
-        var jwt = handler.ReadJwtToken(token);
-        var jti = jwt.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
-        if (string.IsNullOrEmpty(jti)) return Results.BadRequest(new { error = "Invalid token" });
+    // ดึง Expiry จาก Token
+    var expiryClaim = user.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Exp)?.Value;
+    if (!long.TryParse(expiryClaim, out var expiryUnix))
+        return Results.BadRequest(new { error = "Invalid token (missing exp)" });
 
-        var expiry = jwt.ValidTo;
-        if (expiry <= DateTime.UtcNow) return Results.BadRequest(new { error = "Token expired" });
+    var expiry = DateTimeOffset.FromUnixTimeSeconds(expiryUnix).UtcDateTime;
+    if (expiry <= DateTime.UtcNow) 
+        return Results.BadRequest(new { error = "Token already expired" });
+    
+    // เพิ่มเข้า Blacklist ตามเวลาที่เหลือของ Token
+    cache.Set($"blacklist_{jti}", true, expiry - DateTime.UtcNow);
 
-        cache.Set($"blacklist_{jti}", true, expiry - DateTime.UtcNow);
-
-        return Results.Ok(new { message = "Logged out successfully" });
-    }
-    catch (Exception ex)
-    {
-        return Results.Problem($"Error during logout: {ex.Message}", statusCode: 500);
-    }
-}).RequireAuthorization();
+    return Results.Ok(new { message = "Logged out successfully" });
+});
 
 // -------- PROFILE --------
 app.MapGet("/profile", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
@@ -220,7 +234,7 @@ app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext d
         .ToListAsync();
 
     return Results.Ok(categories);
-}).RequireAuthorization();
+});
 
 app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db, CategoryRequest req) =>
 {
@@ -243,7 +257,7 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
     await db.SaveChangesAsync();
 
     return Results.Ok(new { message = "Category created successfully" });
-}).RequireAuthorization();
+});
 
 // -------- BUDGETS --------
 app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
@@ -259,7 +273,7 @@ app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) 
         .ToListAsync();
 
     return Results.Ok(budgets);
-}).RequireAuthorization();
+});
 
 app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db, BudgetRequest req) =>
 {
@@ -286,7 +300,7 @@ app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db,
     await db.SaveChangesAsync();
 
     return Results.Ok(new { message = "Budget created successfully", budget });
-}).RequireAuthorization();
+});
 
 // -------- TRANSACTIONS --------
 app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbContext db, TransactionRequest req) =>
@@ -317,7 +331,7 @@ app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbCon
     await db.SaveChangesAsync();
 
     return Results.Ok(new { message = "Transaction added", transaction });
-}).RequireAuthorization();
+});
 
 app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
@@ -328,22 +342,22 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
     var list = await db.Transactions
         .Where(t => t.UserId == userId)
         .Join(db.Categories,
-              t => t.CategoryId,
-              c => c.Id,
-              (t, c) => new
-              {
-                  t.Id,
-                  t.Amount,
-                  t.Type,
-                  t.Note,
-                  t.CreatedAt,
-                  CategoryName = c.Name
-              })
+            t => t.CategoryId,
+            c => c.Id,
+            (t, c) => new
+            {
+                t.Id,
+                t.Amount,
+                t.Type,
+                t.Note,
+                t.CreatedAt,
+                CategoryName = c.Name
+            })
         .OrderByDescending(t => t.CreatedAt)
         .ToListAsync();
 
     return Results.Ok(list);
-}).RequireAuthorization();
+});
 
 Console.WriteLine("✅ Application configured successfully");
 app.Run();
@@ -374,11 +388,8 @@ public class MyDbContext : DbContext
         base.OnModelCreating(model);
 
         model.Entity<User>().ToTable("users");
-
         model.Entity<Category>().ToTable("categories");
-
         model.Entity<Budget>().ToTable("budgets");
-
         model.Entity<Transaction>().ToTable("transactions");
     }
 }
