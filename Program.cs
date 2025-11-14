@@ -36,56 +36,13 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateIssuerSigningKey = true,
             ValidIssuer = jwtIssuer,
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
-            ClockSkew = TimeSpan.FromMinutes(5), // เพิ่ม clock skew tolerance
-            NameClaimType = ClaimTypes.NameIdentifier // กำหนด name claim type
-        };
-
-        // เพิ่ม event เพื่อ debug
-        options.Events = new JwtBearerEvents
-        {
-            OnAuthenticationFailed = context =>
-            {
-                Console.WriteLine($"❌ JWT Authentication Failed: {context.Exception.Message}");
-                if (context.Exception.InnerException != null)
-                {
-                    Console.WriteLine($"   Inner: {context.Exception.InnerException.Message}");
-                }
-                return Task.CompletedTask;
-            },
-            OnTokenValidated = context =>
-            {
-                var userId = context.Principal?.FindFirstValue(ClaimTypes.NameIdentifier);
-                Console.WriteLine($"✅ JWT Token Validated. UserId: {userId}");
-                
-                // Debug all claims
-                if (context.Principal != null)
-                {
-                    foreach (var claim in context.Principal.Claims)
-                    {
-                        Console.WriteLine($"   Claim: {claim.Type} = {claim.Value}");
-                    }
-                }
-                
-                return Task.CompletedTask;
-            },
-            OnChallenge = context =>
-            {
-                Console.WriteLine($"⚠️ JWT Challenge: {context.Error}, {context.ErrorDescription}");
-                Console.WriteLine($"   AuthenticateFailure: {context.AuthenticateFailure?.Message}");
-                return Task.CompletedTask;
-            },
-            OnMessageReceived = context =>
-            {
-                var authHeader = context.Request.Headers["Authorization"].ToString();
-                Console.WriteLine($"📨 Message Received. Auth header: {(string.IsNullOrEmpty(authHeader) ? "MISSING" : "Present")}");
-                return Task.CompletedTask;
-            }
+            ClockSkew = TimeSpan.FromMinutes(5)
         };
     });
 
 builder.Services.AddAuthorization();
 
-// CORS - เพิ่ม policy ชื่อเฉพาะ
+// CORS - Allow any origin for simplicity
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy =>
@@ -113,33 +70,14 @@ app.UseSwaggerUI(c =>
     c.RoutePrefix = string.Empty;
 });
 
-// ⚠️ CRITICAL: CORS ต้องมาก่อน Authentication/Authorization
+// CORS must come before Authentication
 app.UseCors("AllowAll");
 
-// Global Exception Handler เพื่อให้ CORS headers ถูกส่งไปแม้เกิด error
-app.Use(async (context, next) =>
-{
-    try
-    {
-        await next();
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"❌ Unhandled exception: {ex.Message}");
-        context.Response.StatusCode = 500;
-        context.Response.ContentType = "application/json";
-        await context.Response.WriteAsJsonAsync(new { error = "Internal server error", details = ex.Message });
-    }
-});
-
+// Token blacklist middleware
 app.Use(async (context, next) =>
 {
     var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
     var authHeader = context.Request.Headers["Authorization"].ToString();
-
-    // Debug logging
-    Console.WriteLine($"🔍 Path: {context.Request.Path}");
-    Console.WriteLine($"🔍 Auth Header: {(string.IsNullOrEmpty(authHeader) ? "MISSING" : "Present")}");
 
     if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
     {
@@ -152,16 +90,12 @@ app.Use(async (context, next) =>
 
             if (!string.IsNullOrEmpty(jti) && cache.TryGetValue($"blacklist_{jti}", out _))
             {
-                Console.WriteLine($"⛔ Token blacklisted: {jti}");
                 context.Response.StatusCode = 401;
                 await context.Response.WriteAsJsonAsync(new { error = "Token has been revoked" });
                 return;
             }
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠️ Token validation error: {ex.Message}");
-        }
+        catch { }
     }
 
     await next();
@@ -180,64 +114,13 @@ app.MapGet("/health", () => Results.Ok(new
     environment = app.Environment.EnvironmentName
 }));
 
-// Debug endpoint to test token
-app.MapGet("/debug/token", async (HttpContext context) =>
-{
-    var authHeader = context.Request.Headers["Authorization"].ToString();
-    
-    if (string.IsNullOrEmpty(authHeader))
-        return Results.Ok(new { error = "No Authorization header" });
-    
-    if (!authHeader.StartsWith("Bearer "))
-        return Results.Ok(new { error = "Invalid Authorization format" });
-    
-    var token = authHeader.Substring(7);
-    
-    try
-    {
-        var handler = new JwtSecurityTokenHandler();
-        var jwt = handler.ReadJwtToken(token);
-        
-        var claims = jwt.Claims.Select(c => new { c.Type, c.Value }).ToList();
-        
-        return Results.Ok(new 
-        { 
-            valid = true,
-            issuer = jwt.Issuer,
-            expires = jwt.ValidTo,
-            isExpired = jwt.ValidTo < DateTime.UtcNow,
-            claims = claims
-        });
-    }
-    catch (Exception ex)
-    {
-        return Results.Ok(new { error = $"Token parse failed: {ex.Message}" });
-    }
-});
-
-// Test authenticated endpoint
-app.MapGet("/debug/auth", [Authorize] (HttpContext context) =>
-{
-    var user = context.User;
-    var userId = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    var email = user.FindFirstValue(ClaimTypes.Email);
-    
-    return Results.Ok(new
-    {
-        authenticated = user.Identity?.IsAuthenticated ?? false,
-        userId = userId,
-        email = email,
-        claims = user.Claims.Select(c => new { c.Type, c.Value }).ToList()
-    });
-}).RequireAuthorization();
-
 // -------- REGISTER --------
 app.MapPost("/register", async (MyDbContext db, User user) =>
 {
     try
     {
         if (await db.Users.AnyAsync(u => u.Email == user.Email))
-            return Results.BadRequest("Email already registered");
+            return Results.BadRequest(new { error = "Email already registered" });
 
         user.Id = Guid.NewGuid();
         user.CreatedAt = DateTime.UtcNow;
@@ -295,7 +178,7 @@ app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 });
 
 // -------- LOGOUT --------
-app.MapPost("/logout", [Authorize] async (HttpContext context, IMemoryCache cache) =>
+app.MapPost("/logout", async (HttpContext context, IMemoryCache cache) =>
 {
     try
     {
@@ -354,14 +237,7 @@ app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext d
         var categories = await db.Categories
             .Where(c => c.UserId == userId)
             .OrderBy(c => c.Name)
-            .Select(c => new
-            {
-                c.Id,
-                c.Name,
-                Type = c.Type ?? "",
-                Icon = c.Icon ?? "",
-                Color = c.Color ?? ""
-            })
+            .Select(c => new { c.Id, c.Name })
             .ToListAsync();
 
         return Results.Ok(categories);
@@ -403,71 +279,78 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
     }
 }).RequireAuthorization();
 
-// -------- TRANSACTIONS --------
-app.MapPost("/add-transaction", async (HttpContext context, MyDbContext db, TransactionRequest req) =>
+// -------- BUDGETS --------
+app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
     try
     {
-        // ตรวจสอบ Authorization header
-        var authHeader = context.Request.Headers["Authorization"].ToString();
-        Console.WriteLine($"🔐 Authorization Header: {(string.IsNullOrEmpty(authHeader) ? "MISSING" : "Present")}");
-        
-        if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
-        {
-            Console.WriteLine($"❌ No valid authorization header");
-            return Results.Json(new { error = "Unauthorized: No token provided" }, statusCode: 401);
-        }
-
-        // ดึง user จาก HttpContext
-        var user = context.User;
-        
-        // Debug logging
-        Console.WriteLine($"🔍 User authenticated: {user.Identity?.IsAuthenticated}");
-        Console.WriteLine($"🔍 User identity name: {user.Identity?.Name}");
-        Console.WriteLine($"🔍 Claims count: {user.Claims.Count()}");
-        
-        foreach (var claim in user.Claims)
-        {
-            Console.WriteLine($"   - {claim.Type}: {claim.Value}");
-        }
-
         var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-        Console.WriteLine($"🔍 UserId from claim (NameIdentifier): {idStr}");
-        
-        // ลอง claim types อื่น
-        if (string.IsNullOrEmpty(idStr))
+        if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
+
+        var budgets = await db.Budgets
+            .Where(b => b.UserId == userId)
+            .OrderByDescending(b => b.Year)
+            .ThenByDescending(b => b.Month)
+            .ToListAsync();
+
+        return Results.Ok(budgets);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Budgets error: {ex.Message}");
+        return Results.Problem($"Error fetching budgets: {ex.Message}", statusCode: 500);
+    }
+}).RequireAuthorization();
+
+app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db, BudgetRequest req) =>
+{
+    try
+    {
+        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
+
+        var category = await db.Categories.FindAsync(req.CategoryId);
+        if (category == null || category.UserId != userId)
+            return Results.BadRequest(new { error = "Invalid category" });
+
+        var budget = new Budget
         {
-            idStr = user.FindFirstValue("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier");
-            Console.WriteLine($"🔍 UserId from full claim type: {idStr}");
-        }
-        
-        if (string.IsNullOrEmpty(idStr))
-        {
-            Console.WriteLine($"❌ Cannot find user ID in claims");
-            return Results.Json(
-                new { 
-                    error = "Invalid user ID", 
-                    authenticated = user.Identity?.IsAuthenticated,
-                    claims = user.Claims.Select(c => new { c.Type, c.Value }).ToList()
-                },
-                statusCode: 401
-            );
-        }
-        
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            CategoryId = req.CategoryId,
+            Month = req.Month,
+            Year = req.Year,
+            LimitAmount = req.LimitAmount,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        db.Budgets.Add(budget);
+        await db.SaveChangesAsync();
+
+        return Results.Ok(new { message = "Budget created successfully", budget });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Create budget error: {ex.Message}");
+        return Results.Problem($"Error creating budget: {ex.Message}", statusCode: 500);
+    }
+}).RequireAuthorization();
+
+// -------- TRANSACTIONS --------
+app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbContext db, TransactionRequest req) =>
+{
+    try
+    {
+        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
         if (!Guid.TryParse(idStr, out var userId))
         {
-            Console.WriteLine($"❌ Invalid GUID format: {idStr}");
-            return Results.Json(
-                new { error = $"Invalid user ID format: {idStr}" },
-                statusCode: 401
-            );
+            Console.WriteLine($"❌ Invalid user ID from token: {idStr}");
+            return Results.Problem("Invalid user ID", statusCode: 401);
         }
 
-        Console.WriteLine($"✅ Valid UserId: {userId}");
-
-        if (string.IsNullOrEmpty(req.CategoryId) || !Guid.TryParse(req.CategoryId, out var categoryId))
+        if (!Guid.TryParse(req.CategoryId, out var categoryId))
         {
-            Console.WriteLine($"❌ Invalid category ID: {req.CategoryId}");
+            Console.WriteLine($"❌ Invalid category ID format: {req.CategoryId}");
             return Results.BadRequest(new { error = "Invalid category ID" });
         }
 
@@ -477,11 +360,11 @@ app.MapPost("/add-transaction", async (HttpContext context, MyDbContext db, Tran
             Console.WriteLine($"❌ Category not found: {categoryId}");
             return Results.BadRequest(new { error = "Category not found" });
         }
-        
+
         if (category.UserId != userId)
         {
-            Console.WriteLine($"❌ Category belongs to different user. Category.UserId: {category.UserId}, Current UserId: {userId}");
-            return Results.BadRequest(new { error = "Invalid category - not owned by user" });
+            Console.WriteLine($"❌ Category {categoryId} belongs to user {category.UserId}, not {userId}");
+            return Results.BadRequest(new { error = "Invalid category" });
         }
 
         var transaction = new Transaction
@@ -495,8 +378,6 @@ app.MapPost("/add-transaction", async (HttpContext context, MyDbContext db, Tran
             CreatedAt = DateTime.UtcNow
         };
 
-        Console.WriteLine($"💾 Saving transaction: UserId={transaction.UserId}, CategoryId={transaction.CategoryId}, Amount={transaction.Amount}");
-
         db.Transactions.Add(transaction);
         await db.SaveChangesAsync();
 
@@ -504,13 +385,13 @@ app.MapPost("/add-transaction", async (HttpContext context, MyDbContext db, Tran
         {
             id = transaction.Id.ToString(),
             amount = transaction.Amount,
-            type = transaction.Type ?? "",
-            note = transaction.Note ?? "",
+            type = transaction.Type,
+            note = transaction.Note,
             createdAt = transaction.CreatedAt.ToString("o"),
             categoryName = category.Name
         };
 
-        Console.WriteLine($"✅ Transaction saved successfully");
+        Console.WriteLine($"✅ Transaction created successfully: {transaction.Id}");
         return Results.Ok(new { message = "Transaction added successfully", transaction = response });
     }
     catch (Exception ex)
@@ -519,7 +400,7 @@ app.MapPost("/add-transaction", async (HttpContext context, MyDbContext db, Tran
         Console.WriteLine($"Stack trace: {ex.StackTrace}");
         return Results.Problem($"Error adding transaction: {ex.Message}", statusCode: 500);
     }
-});
+}).RequireAuthorization();
 
 app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
@@ -537,15 +418,25 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
                 {
                     t.Id,
                     t.Amount,
-                    Type = t.Type ?? "",
-                    Note = t.Note ?? "",
+                    t.Type,
+                    t.Note,
                     t.CreatedAt,
                     CategoryName = c.Name
                 })
             .OrderByDescending(t => t.CreatedAt)
             .ToListAsync();
 
-        return Results.Ok(rawTransactions);
+        var transactions = rawTransactions.Select(t => new
+        {
+            id = t.Id.ToString(),
+            amount = t.Amount,
+            type = t.Type,
+            note = t.Note,
+            createdAt = t.CreatedAt.ToString("o"),
+            categoryName = t.CategoryName
+        });
+
+        return Results.Ok(transactions);
     }
     catch (Exception ex)
     {
@@ -577,7 +468,7 @@ public class Category
     public Guid Id { get; set; }
     public Guid UserId { get; set; }
     public string Name { get; set; } = null!;
-    public string? Type { get; set; }
+    public string Type { get; set; } = null!;
     public string? Icon { get; set; }
     public string? Color { get; set; }
     public DateTime CreatedAt { get; set; }
@@ -586,9 +477,36 @@ public class Category
 public class CategoryRequest
 {
     public string Name { get; set; } = null!;
-    public string? Type { get; set; }
+    public string Type { get; set; } = null!;
     public string? Icon { get; set; }
     public string? Color { get; set; }
+}
+
+public class Budget
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public Guid CategoryId { get; set; }
+    public int Month { get; set; }
+    public int Year { get; set; }
+    public decimal LimitAmount { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class BudgetRequest
+{
+    public Guid CategoryId { get; set; }
+    public int Month { get; set; }
+    public int Year { get; set; }
+    public decimal LimitAmount { get; set; }
+}
+
+public class TransactionRequest
+{
+    public string CategoryId { get; set; } = null!;
+    public decimal Amount { get; set; }
+    public string Type { get; set; } = null!;
+    public string? Note { get; set; }
 }
 
 public class Transaction
@@ -597,17 +515,9 @@ public class Transaction
     public Guid UserId { get; set; }
     public Guid CategoryId { get; set; }
     public decimal Amount { get; set; }
-    public string? Type { get; set; }
-    public string? Note { get; set; }
+    public string Type { get; set; } = null!;
+    public string Note { get; set; } = "";
     public DateTime CreatedAt { get; set; }
-}
-
-public class TransactionRequest
-{
-    public string CategoryId { get; set; } = null!;
-    public decimal Amount { get; set; }
-    public string? Type { get; set; }
-    public string? Note { get; set; }
 }
 
 // ================= DB CONTEXT =================
@@ -617,6 +527,7 @@ public class MyDbContext : DbContext
 
     public DbSet<User> Users { get; set; } = null!;
     public DbSet<Category> Categories { get; set; } = null!;
+    public DbSet<Budget> Budgets { get; set; } = null!;
     public DbSet<Transaction> Transactions { get; set; } = null!;
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -641,6 +552,18 @@ public class MyDbContext : DbContext
             entity.Property(e => e.Type).HasColumnName("type");
             entity.Property(e => e.Icon).HasColumnName("icon");
             entity.Property(e => e.Color).HasColumnName("color");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+
+        modelBuilder.Entity<Budget>(entity =>
+        {
+            entity.ToTable("budgets");
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.UserId).HasColumnName("user_id");
+            entity.Property(e => e.CategoryId).HasColumnName("category_id");
+            entity.Property(e => e.Month).HasColumnName("month");
+            entity.Property(e => e.Year).HasColumnName("year");
+            entity.Property(e => e.LimitAmount).HasColumnName("limit_amount");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
 
