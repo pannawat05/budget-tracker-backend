@@ -41,10 +41,10 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
-// CORS
+// CORS - เพิ่ม policy ชื่อเฉพาะ
 builder.Services.AddCors(options =>
 {
-    options.AddDefaultPolicy(policy =>
+    options.AddPolicy("AllowAll", policy =>
     {
         policy.AllowAnyOrigin()
               .AllowAnyHeader()
@@ -69,7 +69,24 @@ app.UseSwaggerUI(c =>
     c.RoutePrefix = string.Empty;
 });
 
-app.UseCors();
+// ⚠️ CRITICAL: CORS ต้องมาก่อน Authentication/Authorization
+app.UseCors("AllowAll");
+
+// Global Exception Handler เพื่อให้ CORS headers ถูกส่งไปแม้เกิด error
+app.Use(async (context, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Unhandled exception: {ex.Message}");
+        context.Response.StatusCode = 500;
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsJsonAsync(new { error = "Internal server error", details = ex.Message });
+    }
+});
 
 app.Use(async (context, next) =>
 {
@@ -114,60 +131,76 @@ app.MapGet("/health", () => Results.Ok(new
 // -------- REGISTER --------
 app.MapPost("/register", async (MyDbContext db, User user) =>
 {
-    if (await db.Users.AnyAsync(u => u.Email == user.Email))
-        return Results.BadRequest("Email already registered");
+    try
+    {
+        if (await db.Users.AnyAsync(u => u.Email == user.Email))
+            return Results.BadRequest("Email already registered");
 
-    user.Id = Guid.NewGuid();
-    user.CreatedAt = DateTime.UtcNow;
-    user.Password = BCrypt.Net.BCrypt.HashPassword(user.Password);
+        user.Id = Guid.NewGuid();
+        user.CreatedAt = DateTime.UtcNow;
+        user.Password = BCrypt.Net.BCrypt.HashPassword(user.Password);
 
-    db.Users.Add(user);
-    await db.SaveChangesAsync();
+        db.Users.Add(user);
+        await db.SaveChangesAsync();
 
-    return Results.Ok(new { message = "User registered successfully" });
+        return Results.Ok(new { message = "User registered successfully" });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Register error: {ex.Message}");
+        return Results.Problem($"Registration failed: {ex.Message}", statusCode: 500);
+    }
 });
 
 // -------- LOGIN --------
 app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 {
-    var user = await db.Users.FirstOrDefaultAsync(u => u.Email == req.Email);
-    if (user == null || !BCrypt.Net.BCrypt.Verify(req.Password, user.Password))
-        return Results.Unauthorized();
-
-    var handler = new JwtSecurityTokenHandler();
-    var keyBytes = Encoding.UTF8.GetBytes(jwtKey);
-
-    var tokenDescriptor = new SecurityTokenDescriptor
+    try
     {
-        Subject = new ClaimsIdentity(new[]
+        var user = await db.Users.FirstOrDefaultAsync(u => u.Email == req.Email);
+        if (user == null || !BCrypt.Net.BCrypt.Verify(req.Password, user.Password))
+            return Results.Unauthorized();
+
+        var handler = new JwtSecurityTokenHandler();
+        var keyBytes = Encoding.UTF8.GetBytes(jwtKey);
+
+        var tokenDescriptor = new SecurityTokenDescriptor
         {
-            new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
-            new Claim(ClaimTypes.Email, user.Email),
-            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
-        }),
-        Expires = DateTime.UtcNow.AddHours(2),
-        Issuer = jwtIssuer,
-        SigningCredentials = new SigningCredentials(
-            new SymmetricSecurityKey(keyBytes),
-            SecurityAlgorithms.HmacSha256Signature)
-    };
+            Subject = new ClaimsIdentity(new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                new Claim(ClaimTypes.Email, user.Email),
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+            }),
+            Expires = DateTime.UtcNow.AddHours(2),
+            Issuer = jwtIssuer,
+            SigningCredentials = new SigningCredentials(
+                new SymmetricSecurityKey(keyBytes),
+                SecurityAlgorithms.HmacSha256Signature)
+        };
 
-    var token = handler.CreateToken(tokenDescriptor);
-    var jwt = handler.WriteToken(token);
+        var token = handler.CreateToken(tokenDescriptor);
+        var jwt = handler.WriteToken(token);
 
-    return Results.Ok(new { token = jwt });
+        return Results.Ok(new { token = jwt });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Login error: {ex.Message}");
+        return Results.Problem($"Login failed: {ex.Message}", statusCode: 500);
+    }
 });
 
 // -------- LOGOUT --------
 app.MapPost("/logout", [Authorize] async (HttpContext context, IMemoryCache cache) =>
 {
-    var authHeader = context.Request.Headers["Authorization"].ToString();
-    if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
-        return Results.BadRequest(new { error = "No token provided" });
-
-    var token = authHeader.Substring(7);
     try
     {
+        var authHeader = context.Request.Headers["Authorization"].ToString();
+        if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
+            return Results.BadRequest(new { error = "No token provided" });
+
+        var token = authHeader.Substring(7);
         var handler = new JwtSecurityTokenHandler();
         var jwt = handler.ReadJwtToken(token);
         var jti = jwt.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
@@ -182,6 +215,7 @@ app.MapPost("/logout", [Authorize] async (HttpContext context, IMemoryCache cach
     }
     catch (Exception ex)
     {
+        Console.WriteLine($"❌ Logout error: {ex.Message}");
         return Results.Problem($"Error during logout: {ex.Message}", statusCode: 500);
     }
 }).RequireAuthorization();
@@ -189,122 +223,164 @@ app.MapPost("/logout", [Authorize] async (HttpContext context, IMemoryCache cach
 // -------- PROFILE --------
 app.MapGet("/profile", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
+    try
+    {
+        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    var profile = await db.Users.FindAsync(userId);
-    if (profile == null) return Results.NotFound();
+        var profile = await db.Users.FindAsync(userId);
+        if (profile == null) return Results.NotFound();
 
-    return Results.Ok(new { profile.Id, profile.Email, profile.CreatedAt });
+        return Results.Ok(new { profile.Id, profile.Email, profile.CreatedAt });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Profile error: {ex.Message}");
+        return Results.Problem($"Error fetching profile: {ex.Message}", statusCode: 500);
+    }
 }).RequireAuthorization();
 
 // -------- CATEGORIES --------
 app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
+    try
+    {
+        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    var categories = await db.Categories
-        .Where(c => c.UserId == userId)
-        .OrderBy(c => c.Name)
-        .Select(c => new
-        {
-            c.Id,
-            c.Name,
-            Type = c.Type ?? "",
-            Icon = c.Icon ?? "",
-            Color = c.Color ?? ""
-        })
-        .ToListAsync();
+        var categories = await db.Categories
+            .Where(c => c.UserId == userId)
+            .OrderBy(c => c.Name)
+            .Select(c => new
+            {
+                c.Id,
+                c.Name,
+                Type = c.Type ?? "",
+                Icon = c.Icon ?? "",
+                Color = c.Color ?? ""
+            })
+            .ToListAsync();
 
-    return Results.Ok(categories);
+        return Results.Ok(categories);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Categories error: {ex.Message}");
+        return Results.Problem($"Error fetching categories: {ex.Message}", statusCode: 500);
+    }
 }).RequireAuthorization();
 
 app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db, CategoryRequest req) =>
 {
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
-
-    var category = new Category
+    try
     {
-        Id = Guid.NewGuid(),
-        UserId = userId,
-        Name = req.Name,
-        Type = req.Type,
-        Icon = req.Icon,
-        Color = req.Color,
-        CreatedAt = DateTime.UtcNow
-    };
+        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    db.Categories.Add(category);
-    await db.SaveChangesAsync();
+        var category = new Category
+        {
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            Name = req.Name,
+            Type = req.Type,
+            Icon = req.Icon,
+            Color = req.Color,
+            CreatedAt = DateTime.UtcNow
+        };
 
-    return Results.Ok(new { message = "Category created successfully", category = new { category.Id, category.Name } });
+        db.Categories.Add(category);
+        await db.SaveChangesAsync();
+
+        return Results.Ok(new { message = "Category created successfully", category = new { category.Id, category.Name } });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Create category error: {ex.Message}");
+        return Results.Problem($"Error creating category: {ex.Message}", statusCode: 500);
+    }
 }).RequireAuthorization();
 
 // -------- TRANSACTIONS --------
 app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbContext db, TransactionRequest req) =>
 {
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
-
-    if (!Guid.TryParse(req.CategoryId, out var categoryId))
-        return Results.BadRequest("Invalid category ID");
-
-    var category = await db.Categories.FindAsync(categoryId);
-    if (category == null || category.UserId != userId)
-        return Results.BadRequest("Invalid category");
-
-    var transaction = new Transaction
+    try
     {
-        Id = Guid.NewGuid(),
-        UserId = userId,
-        CategoryId = categoryId,
-        Amount = req.Amount,
-        Type = req.Type,
-        Note = req.Note ?? "",
-        CreatedAt = DateTime.UtcNow
-    };
+        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!Guid.TryParse(idStr, out var userId)) 
+            return Results.Problem("Invalid user ID", statusCode: 401);
 
-    db.Transactions.Add(transaction);
-    await db.SaveChangesAsync();
+        if (string.IsNullOrEmpty(req.CategoryId) || !Guid.TryParse(req.CategoryId, out var categoryId))
+            return Results.BadRequest(new { error = "Invalid category ID" });
 
-    var response = new
+        var category = await db.Categories.FindAsync(categoryId);
+        if (category == null || category.UserId != userId)
+            return Results.BadRequest(new { error = "Invalid category" });
+
+        var transaction = new Transaction
+        {
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            CategoryId = categoryId,
+            Amount = req.Amount,
+            Type = req.Type,
+            Note = req.Note ?? "",
+            CreatedAt = DateTime.UtcNow
+        };
+
+        db.Transactions.Add(transaction);
+        await db.SaveChangesAsync();
+
+        var response = new
+        {
+            id = transaction.Id.ToString(),
+            amount = transaction.Amount,
+            type = transaction.Type ?? "",
+            note = transaction.Note ?? "",
+            createdAt = transaction.CreatedAt.ToString("o"),
+            categoryName = category.Name
+        };
+
+        return Results.Ok(new { message = "Transaction added successfully", transaction = response });
+    }
+    catch (Exception ex)
     {
-        id = transaction.Id.ToString(),
-        amount = transaction.Amount,
-        type = transaction.Type ?? "",
-        note = transaction.Note ?? "",
-        createdAt = transaction.CreatedAt.ToString("o"),
-        categoryName = category.Name
-    };
-
-    return Results.Ok(new { message = "Transaction added successfully", transaction = response });
+        Console.WriteLine($"❌ Add transaction error: {ex.Message}");
+        Console.WriteLine($"Stack trace: {ex.StackTrace}");
+        return Results.Problem($"Error adding transaction: {ex.Message}", statusCode: 500);
+    }
 }).RequireAuthorization();
 
 app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
-    var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
+    try
+    {
+        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    var rawTransactions = await db.Transactions
-        .Where(t => t.UserId == userId)
-        .Join(db.Categories,
-            t => t.CategoryId,
-            c => c.Id,
-            (t, c) => new
-            {
-                t.Id,
-                t.Amount,
-                Type = t.Type ?? "",
-                Note = t.Note ?? "",
-                t.CreatedAt,
-                CategoryName = c.Name
-            })
-        .OrderByDescending(t => t.CreatedAt)
-        .ToListAsync();
+        var rawTransactions = await db.Transactions
+            .Where(t => t.UserId == userId)
+            .Join(db.Categories,
+                t => t.CategoryId,
+                c => c.Id,
+                (t, c) => new
+                {
+                    t.Id,
+                    t.Amount,
+                    Type = t.Type ?? "",
+                    Note = t.Note ?? "",
+                    t.CreatedAt,
+                    CategoryName = c.Name
+                })
+            .OrderByDescending(t => t.CreatedAt)
+            .ToListAsync();
 
-    return Results.Ok(rawTransactions);
+        return Results.Ok(rawTransactions);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Get transactions error: {ex.Message}");
+        return Results.Problem($"Error fetching transactions: {ex.Message}", statusCode: 500);
+    }
 }).RequireAuthorization();
 
 Console.WriteLine("✅ Application configured successfully");
