@@ -35,14 +35,13 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateLifetime = true,
             ValidateIssuerSigningKey = true,
             ValidIssuer = jwtIssuer,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
-            ClockSkew = TimeSpan.FromMinutes(5)
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
         };
     });
 
 builder.Services.AddAuthorization();
 
-// CORS - Allow any origin for simplicity
+// CORS - เพิ่ม policy ชื่อเฉพาะ
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy =>
@@ -70,10 +69,25 @@ app.UseSwaggerUI(c =>
     c.RoutePrefix = string.Empty;
 });
 
-// CORS must come before Authentication
+// ⚠️ CRITICAL: CORS ต้องมาก่อน Authentication/Authorization
 app.UseCors("AllowAll");
 
-// Token blacklist middleware
+// Global Exception Handler เพื่อให้ CORS headers ถูกส่งไปแม้เกิด error
+app.Use(async (context, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Unhandled exception: {ex.Message}");
+        context.Response.StatusCode = 500;
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsJsonAsync(new { error = "Internal server error", details = ex.Message });
+    }
+});
+
 app.Use(async (context, next) =>
 {
     var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
@@ -114,48 +128,13 @@ app.MapGet("/health", () => Results.Ok(new
     environment = app.Environment.EnvironmentName
 }));
 
-// Fix categories with null type
-app.MapPost("/fix-categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
-{
-    try
-    {
-        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (!Guid.TryParse(idStr, out var userId)) 
-            return Results.Problem("Invalid user ID", statusCode: 401);
-
-        // ใช้ raw SQL เพราะ EF Core ไม่สามารถ query categories ที่ user_id เป็น null ได้
-        var fixedCount = await db.Database.ExecuteSqlRawAsync(
-            $"UPDATE categories SET user_id = '{userId}', type = COALESCE(type, 'expense') WHERE user_id IS NULL"
-        );
-
-        // ดึงข้อมูลที่แก้ไขแล้ว
-        var categories = await db.Categories
-            .Where(c => c.UserId == userId)
-            .Select(c => new { c.Id, c.Name, c.Type, c.UserId })
-            .ToListAsync();
-
-        return Results.Ok(new 
-        { 
-            message = "Categories fixed successfully", 
-            updated = fixedCount,
-            totalCategories = categories.Count,
-            categories = categories
-        });
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"❌ Fix categories error: {ex.Message}");
-        return Results.Problem($"Error: {ex.Message}", statusCode: 500);
-    }
-}).RequireAuthorization();
-
 // -------- REGISTER --------
 app.MapPost("/register", async (MyDbContext db, User user) =>
 {
     try
     {
         if (await db.Users.AnyAsync(u => u.Email == user.Email))
-            return Results.BadRequest(new { error = "Email already registered" });
+            return Results.BadRequest("Email already registered");
 
         user.Id = Guid.NewGuid();
         user.CreatedAt = DateTime.UtcNow;
@@ -213,7 +192,7 @@ app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 });
 
 // -------- LOGOUT --------
-app.MapPost("/logout", async (HttpContext context, IMemoryCache cache) =>
+app.MapPost("/logout", [Authorize] async (HttpContext context, IMemoryCache cache) =>
 {
     try
     {
@@ -272,7 +251,14 @@ app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext d
         var categories = await db.Categories
             .Where(c => c.UserId == userId)
             .OrderBy(c => c.Name)
-            .Select(c => new { c.Id, c.Name })
+            .Select(c => new
+            {
+                c.Id,
+                c.Name,
+                Type = c.Type ?? "",
+                Icon = c.Icon ?? "",
+                Color = c.Color ?? ""
+            })
             .ToListAsync();
 
         return Results.Ok(categories);
@@ -296,7 +282,7 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
             Id = Guid.NewGuid(),
             UserId = userId,
             Name = req.Name,
-            Type = req.Type ?? "expense", // ✅ ให้ default value
+            Type = req.Type,
             Icon = req.Icon,
             Color = req.Color,
             CreatedAt = DateTime.UtcNow
@@ -314,93 +300,21 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
     }
 }).RequireAuthorization();
 
-// -------- BUDGETS --------
-app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
-{
-    try
-    {
-        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
-
-        var budgets = await db.Budgets
-            .Where(b => b.UserId == userId)
-            .OrderByDescending(b => b.Year)
-            .ThenByDescending(b => b.Month)
-            .ToListAsync();
-
-        return Results.Ok(budgets);
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"❌ Budgets error: {ex.Message}");
-        return Results.Problem($"Error fetching budgets: {ex.Message}", statusCode: 500);
-    }
-}).RequireAuthorization();
-
-app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db, BudgetRequest req) =>
-{
-    try
-    {
-        var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
-
-        var category = await db.Categories.FindAsync(req.CategoryId);
-        if (category == null || category.UserId != userId)
-            return Results.BadRequest(new { error = "Invalid category" });
-
-        var budget = new Budget
-        {
-            Id = Guid.NewGuid(),
-            UserId = userId,
-            CategoryId = req.CategoryId,
-            Month = req.Month,
-            Year = req.Year,
-            LimitAmount = req.LimitAmount,
-            CreatedAt = DateTime.UtcNow
-        };
-
-        db.Budgets.Add(budget);
-        await db.SaveChangesAsync();
-
-        return Results.Ok(new { message = "Budget created successfully", budget });
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"❌ Create budget error: {ex.Message}");
-        return Results.Problem($"Error creating budget: {ex.Message}", statusCode: 500);
-    }
-}).RequireAuthorization();
-
 // -------- TRANSACTIONS --------
 app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbContext db, TransactionRequest req) =>
 {
     try
     {
         var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (!Guid.TryParse(idStr, out var userId))
-        {
-            Console.WriteLine($"❌ Invalid user ID from token: {idStr}");
+        if (!Guid.TryParse(idStr, out var userId)) 
             return Results.Problem("Invalid user ID", statusCode: 401);
-        }
 
-        if (!Guid.TryParse(req.CategoryId, out var categoryId))
-        {
-            Console.WriteLine($"❌ Invalid category ID format: {req.CategoryId}");
+        if (string.IsNullOrEmpty(req.CategoryId) || !Guid.TryParse(req.CategoryId, out var categoryId))
             return Results.BadRequest(new { error = "Invalid category ID" });
-        }
 
         var category = await db.Categories.FindAsync(categoryId);
-        if (category == null)
-        {
-            Console.WriteLine($"❌ Category not found: {categoryId}");
-            return Results.BadRequest(new { error = "Category not found" });
-        }
-
-        if (category.UserId != userId)
-        {
-            Console.WriteLine($"❌ Category {categoryId} belongs to user {category.UserId}, not {userId}");
+        if (category == null || category.UserId != userId)
             return Results.BadRequest(new { error = "Invalid category" });
-        }
 
         var transaction = new Transaction
         {
@@ -420,13 +334,12 @@ app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbCon
         {
             id = transaction.Id.ToString(),
             amount = transaction.Amount,
-            type = transaction.Type,
-            note = transaction.Note,
+            type = transaction.Type ?? "",
+            note = transaction.Note ?? "",
             createdAt = transaction.CreatedAt.ToString("o"),
             categoryName = category.Name
         };
 
-        Console.WriteLine($"✅ Transaction created successfully: {transaction.Id}");
         return Results.Ok(new { message = "Transaction added successfully", transaction = response });
     }
     catch (Exception ex)
@@ -453,25 +366,15 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
                 {
                     t.Id,
                     t.Amount,
-                    t.Type,
-                    t.Note,
+                    Type = t.Type ?? "",
+                    Note = t.Note ?? "",
                     t.CreatedAt,
                     CategoryName = c.Name
                 })
             .OrderByDescending(t => t.CreatedAt)
             .ToListAsync();
 
-        var transactions = rawTransactions.Select(t => new
-        {
-            id = t.Id.ToString(),
-            amount = t.Amount,
-            type = t.Type,
-            note = t.Note,
-            createdAt = t.CreatedAt.ToString("o"),
-            categoryName = t.CategoryName
-        });
-
-        return Results.Ok(transactions);
+        return Results.Ok(rawTransactions);
     }
     catch (Exception ex)
     {
@@ -503,7 +406,7 @@ public class Category
     public Guid Id { get; set; }
     public Guid UserId { get; set; }
     public string Name { get; set; } = null!;
-    public string? Type { get; set; } // ✅ เปลี่ยนเป็น nullable
+    public string? Type { get; set; }
     public string? Icon { get; set; }
     public string? Color { get; set; }
     public DateTime CreatedAt { get; set; }
@@ -512,36 +415,9 @@ public class Category
 public class CategoryRequest
 {
     public string Name { get; set; } = null!;
-    public string? Type { get; set; } // ✅ เปลี่ยนเป็น nullable
+    public string? Type { get; set; }
     public string? Icon { get; set; }
     public string? Color { get; set; }
-}
-
-public class Budget
-{
-    public Guid Id { get; set; }
-    public Guid UserId { get; set; }
-    public Guid CategoryId { get; set; }
-    public int Month { get; set; }
-    public int Year { get; set; }
-    public decimal LimitAmount { get; set; }
-    public DateTime CreatedAt { get; set; }
-}
-
-public class BudgetRequest
-{
-    public Guid CategoryId { get; set; }
-    public int Month { get; set; }
-    public int Year { get; set; }
-    public decimal LimitAmount { get; set; }
-}
-
-public class TransactionRequest
-{
-    public string CategoryId { get; set; } = null!;
-    public decimal Amount { get; set; }
-    public string Type { get; set; } = null!;
-    public string? Note { get; set; }
 }
 
 public class Transaction
@@ -550,9 +426,17 @@ public class Transaction
     public Guid UserId { get; set; }
     public Guid CategoryId { get; set; }
     public decimal Amount { get; set; }
-    public string Type { get; set; } = null!;
-    public string Note { get; set; } = "";
+    public string? Type { get; set; }
+    public string? Note { get; set; }
     public DateTime CreatedAt { get; set; }
+}
+
+public class TransactionRequest
+{
+    public string CategoryId { get; set; } = null!;
+    public decimal Amount { get; set; }
+    public string? Type { get; set; }
+    public string? Note { get; set; }
 }
 
 // ================= DB CONTEXT =================
@@ -562,7 +446,6 @@ public class MyDbContext : DbContext
 
     public DbSet<User> Users { get; set; } = null!;
     public DbSet<Category> Categories { get; set; } = null!;
-    public DbSet<Budget> Budgets { get; set; } = null!;
     public DbSet<Transaction> Transactions { get; set; } = null!;
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -587,18 +470,6 @@ public class MyDbContext : DbContext
             entity.Property(e => e.Type).HasColumnName("type");
             entity.Property(e => e.Icon).HasColumnName("icon");
             entity.Property(e => e.Color).HasColumnName("color");
-            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
-        });
-
-        modelBuilder.Entity<Budget>(entity =>
-        {
-            entity.ToTable("budgets");
-            entity.Property(e => e.Id).HasColumnName("id");
-            entity.Property(e => e.UserId).HasColumnName("user_id");
-            entity.Property(e => e.CategoryId).HasColumnName("category_id");
-            entity.Property(e => e.Month).HasColumnName("month");
-            entity.Property(e => e.Year).HasColumnName("year");
-            entity.Property(e => e.LimitAmount).HasColumnName("limit_amount");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
 
