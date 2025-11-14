@@ -9,5 +9,5 @@ dotnet ef database update
 # ถ้าสำเร็จ...
 echo "Migrations applied successfully."
 
-# รันคำสั่งหลักที่ส่งมาจาก Dockerfile (คือ `dotnet YourApiProjectName.dll`)
+# รันคำสั่งหลักที่ส่งมาจาก Dockerfile (คือ `dotnet server.dll`)
 exec "$@"
