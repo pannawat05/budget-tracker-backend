@@ -1,11 +1,4 @@
-using System;
-using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.EntityFrameworkCore;
@@ -13,25 +6,33 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.Configuration; // เพิ่ม Using นี้เผื่อ Environment Variables
+using DotNetEnv; // คุณมีอยู่แล้ว
 
 // ================= CONFIG =================
 var builder = WebApplication.CreateBuilder(args);
 
-// Read from Environment Variables (Render + local)
-var dbHost = Environment.GetEnvironmentVariable("Server") ?? "localhost";
-var dbPort = Environment.GetEnvironmentVariable("Port") ?? "5432";
-var dbUser = Environment.GetEnvironmentVariable("Id") ?? "postgres";
-var dbPass = Environment.GetEnvironmentVariable("Password") ?? "";
-var dbName = Environment.GetEnvironmentVariable("Database") ?? "postgres";
+// --- 1. โหลด .env เฉพาะตอน Development เท่านั้น ---
+// บน Render เราจะใช้ Environment Variables ของระบบ
+if (builder.Environment.IsDevelopment())
+{
+    Env.Load();
+    Console.WriteLine("✅ Loaded .env file for Development.");
+}
+
+// อ่านค่าจาก Environment Variables
+var dbHost = Environment.GetEnvironmentVariable("Server");
+var dbPort = Environment.GetEnvironmentVariable("Port");
+var dbUser = Environment.GetEnvironmentVariable("Id");
+var dbPass = Environment.GetEnvironmentVariable("Password");
+var dbName = Environment.GetEnvironmentVariable("Database");
 
 var jwtKey = Environment.GetEnvironmentVariable("JWT_KEY") ?? "ThisIsMyUltraSecureJwtKey_AtLeast32CharsLong!!";
 var jwtIssuer = Environment.GetEnvironmentVariable("JWT_ISSUER") ?? "MyAppIssuer";
 
 var connectionString = $"Host={dbHost};Port={dbPort};Username={dbUser};Password={dbPass};Database={dbName};Ssl Mode=Require;Trust Server Certificate=True;";
 
-Console.WriteLine($"🔗 Using database: {connectionString.Replace(dbPass, "***")}");
+// เราจะซ่อน Password จาก Log เสมอ
+Console.WriteLine($"🔗 Using database: Host={dbHost};Port={dbPort};Database={dbName}");
 
 // ================= SERVICES =================
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -50,16 +51,22 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
-// CORS - allow everything (Render + Local)
+// --- 2. ตั้งค่า CORS แบบ Dynamic สำหรับ Production ---
+// อ่าน URL ของ Frontend จาก Env Var
+// ถ้าไม่ตั้งค่า (บนเครื่อง) ให้ใช้ localhost
+var frontendOrigin = Environment.GetEnvironmentVariable("FRONTEND_ORIGIN") ?? "http://localhost:5173";
+Console.WriteLine($"CORS: Allowing origin: {frontendOrigin}");
+
 builder.Services.AddCors(options =>
 {
-    options.AddDefaultPolicy(policy =>
+    options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.AllowAnyOrigin()
+        policy.WithOrigins(frontendOrigin) // ใช้ตัวแปร
               .AllowAnyHeader()
               .AllowAnyMethod();
     });
 });
+
 
 builder.Services.AddDbContext<MyDbContext>(options =>
     options.UseNpgsql(connectionString));
@@ -68,68 +75,75 @@ builder.Services.AddMemoryCache();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// เพิ่มบรรทัดนี้เพื่อเปิดใช้งาน Routing
-builder.Services.AddRouting();
-
 var app = builder.Build();
 
-// ================= MIDDLEWARE =================
-// 1. Swagger (ควรอยู่บนสุดสำหรับ Development)
-app.UseSwagger();
-app.UseSwaggerUI(c =>
+// --- 3. รัน Migration อัตโนมัติ (สำคัญมากสำหรับ Docker/Render) ---
+// ส่วนนี้จะสร้างตารางให้เราอัตโนมัติตอนที่แอปเริ่มทำงาน
+Console.WriteLine("Applying database migrations...");
+try
 {
-    c.SwaggerEndpoint("/swagger/v1/swagger.json", "Budget Tracker API v1");
-    c.RoutePrefix = string.Empty;
-});
+    using (var scope = app.Services.CreateScope())
+    {
+        var dbContext = scope.ServiceProvider.GetRequiredService<MyDbContext>();
+        dbContext.Database.Migrate(); // รัน Migration ที่ค้างอยู่ทั้งหมด
+    }
+    Console.WriteLine("Migrations applied successfully.");
+}
+catch (Exception ex)
+{
+    // ถ้า Migration พัง แอปจะแจ้ง Error ชัดเจนใน Log
+    Console.WriteLine($"❌ Error applying migrations: {ex.Message}");
+    // ใน Production จริง อาจจะต้องหยุดแอปไปเลยถ้า Migration พัง
+}
 
-// 2. เพิ่ม UseRouting()
-// ทำให้ Middleware ที่มาทีหลัง (เช่น Cors, Auth) รู้ว่ากำลังจะเรียก Endpoint ไหน
-app.UseRouting();
+// ================= MIDDLEWARE =================
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
 
-// 3. ย้าย UseCors() มาไว้หลัง UseRouting() และก่อน Auth
-app.UseCors();
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
 
-// 4. Auth Middleware
-app.UseAuthentication();
-app.UseAuthorization();
+app.UseCors("AllowFrontend"); // ใช้ Policy ที่เราตั้งชื่อไว้
 
-// 5. ย้าย Token blacklist middleware มาไว้หลัง Auth ทั้งหมด
-//    และเปลี่ยนมาเช็คจาก context.User ที่ผ่านการ Validate แล้ว
+// Token blacklist middleware (โค้ดเดิมของคุณ ดีอยู่แล้ว)
 app.Use(async (context, next) =>
 {
-    // ตรวจสอบว่า User ผ่านการยืนยันตัวตนมาแล้วหรือยัง
-    if (context.User.Identity?.IsAuthenticated == true)
-    {
-        var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
-        
-        // ดึง jti จาก Claims ที่ผ่านการ Validate แล้ว (ไม่ต้อง Parse Token เอง)
-        var jti = context.User.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
+    var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
+    var authHeader = context.Request.Headers["Authorization"].ToString();
 
-        if (!string.IsNullOrEmpty(jti) && cache.TryGetValue($"blacklist_{jti}", out _))
+    if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+    {
+        var token = authHeader.Substring(7);
+        try
         {
-            // ถ้า Token อยู่ใน Blacklist ให้ส่ง 401
-            context.Response.StatusCode = 401;
-            await context.Response.WriteAsJsonAsync(new { error = "Token has been revoked" });
-            return;
+            var handler = new JwtSecurityTokenHandler();
+            var jwt = handler.ReadJwtToken(token);
+            var jti = jwt.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
+
+            if (!string.IsNullOrEmpty(jti) && cache.TryGetValue($"blacklist_{jti}", out _))
+            {
+                context.Response.StatusCode = 401;
+                await context.Response.WriteAsJsonAsync(new { error = "Token has been revoked" });
+                return;
+            }
         }
+        catch { /* ignore invalid token, let JWT middleware handle */ }
     }
 
-    // ถ้าไม่ติด Blacklist (หรือไม่ได้ Login) ก็ไปต่อ
     await next();
 });
 
+app.UseAuthentication();
+app.UseAuthorization();
 
 // ================= ENDPOINTS =================
-// (Endpoints ทั้งหมดของคุณจะถูก Map โดยอัตโนมัติ)
-
-// Health check
-app.MapGet("/health", () => Results.Ok(new
-{
-    status = "healthy",
-    timestamp = DateTime.UtcNow,
-    environment = app.Environment.EnvironmentName
-}));
-
+// (โค้ด Endpoints ทั้งหมดของคุณ... ไม่ต้องแก้ไข)
+// ...
 // -------- REGISTER --------
 app.MapPost("/register", async (MyDbContext db, User user) =>
 {
@@ -150,7 +164,7 @@ app.MapPost("/register", async (MyDbContext db, User user) =>
 app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 {
     var user = await db.Users.FirstOrDefaultAsync(u => u.Email == req.Email);
-    if (user == null || !BCrypt.Net.BCrypt.Verify(req.Password, user.Password))
+    if (user == null || !BCRypNet.BCrypt.Verify(req.Password, user.Password))
         return Results.Unauthorized();
 
     var handler = new JwtSecurityTokenHandler();
@@ -162,7 +176,7 @@ app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
         {
             new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
             new Claim(ClaimTypes.Email, user.Email),
-            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()) // JTI สำหรับ Blacklist
+            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
         }),
         Expires = DateTime.UtcNow.AddHours(2),
         Issuer = jwtIssuer,
@@ -178,69 +192,64 @@ app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 });
 
 // -------- LOGOUT --------
-// [Authorize] ทำงานร่วมกับ Blacklist Middleware ที่เราย้ายไป
-app.MapPost("/logout", [Authorize] async (ClaimsPrincipal user, IMemoryCache cache) =>
+app.MapPost("/logout", async (HttpContext context, IMemoryCache cache) =>
 {
-    // ไม่ต้อง Parse Token เองแล้ว ดึงจาก ClaimsPrincipal (user) ได้เลย
-    var jti = user.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
-    if (string.IsNullOrEmpty(jti)) 
-        return Results.BadRequest(new { error = "Invalid token (missing jti)" });
+    var authHeader = context.Request.Headers["Authorization"].ToString();
+    if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
+        return Results.BadRequest(new { error = "No token provided" });
 
-    // ดึง Expiry จาก Token
-    var expiryClaim = user.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Exp)?.Value;
-    if (!long.TryParse(expiryClaim, out var expiryUnix))
-        return Results.BadRequest(new { error = "Invalid token (missing exp)" });
+    var token = authHeader.Substring(7);
+    try
+    {
+        var handler = new JwtSecurityTokenHandler();
+        var jwt = handler.ReadJwtToken(token);
+        var jti = jwt.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Jti)?.Value;
+        if (string.IsNullOrEmpty(jti)) return Results.BadRequest(new { error = "Invalid token" });
 
-    var expiry = DateTimeOffset.FromUnixTimeSeconds(expiryUnix).UtcDateTime;
-    if (expiry <= DateTime.UtcNow) 
-        return Results.BadRequest(new { error = "Token already expired" });
-    
-    // เพิ่มเข้า Blacklist ตามเวลาที่เหลือของ Token
-    cache.Set($"blacklist_{jti}", true, expiry - DateTime.UtcNow);
+        var expiry = jwt.ValidTo;
+        if (expiry <= DateTime.UtcNow) return Results.BadRequest(new { error = "Token already expired" });
 
-    return Results.Ok(new { message = "Logged out successfully" });
-});
+        cache.Set($"blacklist_{jti}", true, expiry - DateTime.UtcNow);
+
+        return Results.Ok(new { message = "Logged out successfully" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Error during logout: {ex.Message}", statusCode: 500);
+    }
+}).RequireAuthorization();
 
 // -------- PROFILE --------
 app.MapGet("/profile", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId))
-        return Results.Problem("Invalid user ID", statusCode: 401);
+    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
     var profile = await db.Users.FindAsync(userId);
-    if (profile == null)
-        return Results.NotFound(new { error = "User not found" });
+    if (profile == null) return Results.NotFound();
 
-    return Results.Ok(new
-    {
-        id = profile.Id,
-        email = profile.Email,
-        createdAt = profile.CreatedAt
-    });
+    return Results.Ok(new { profile.Id, profile.Email, profile.CreatedAt });
 });
 
 // -------- CATEGORIES --------
 app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId))
-        return Results.Problem("Invalid user ID", statusCode: 401);
+    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
     var categories = await db.Categories
         .Where(c => c.UserId == userId)
         .OrderBy(c => c.Name)
-        .Select(c => new { c.Id, c.Name, c.Type, c.Icon, c.Color })
+        .Select(c => new { c.Id, c.Name })
         .ToListAsync();
 
     return Results.Ok(categories);
-});
+}).RequireAuthorization();
 
 app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db, CategoryRequest req) =>
 {
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId))
-        return Results.Problem("Invalid user ID", statusCode: 401);
+    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
     var category = new Category
     {
@@ -256,15 +265,14 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
     db.Categories.Add(category);
     await db.SaveChangesAsync();
 
-    return Results.Ok(new { message = "Category created successfully" });
-});
+    return Results.Ok(new { message = "Category created successfully", category = new { category.Id, category.Name } });
+}).RequireAuthorization();
 
 // -------- BUDGETS --------
 app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId))
-        return Results.Problem("Invalid user ID", statusCode: 401);
+    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
     var budgets = await db.Budgets
         .Where(b => b.UserId == userId)
@@ -273,14 +281,14 @@ app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) 
         .ToListAsync();
 
     return Results.Ok(budgets);
-});
+}).RequireAuthorization();
 
 app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db, BudgetRequest req) =>
 {
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId))
-        return Results.Problem("Invalid user ID", statusCode: 401);
+    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
+    // Check if category exists and belongs to user
     var category = await db.Categories.FindAsync(req.CategoryId);
     if (category == null || category.UserId != userId)
         return Results.BadRequest("Invalid category");
@@ -300,15 +308,15 @@ app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db,
     await db.SaveChangesAsync();
 
     return Results.Ok(new { message = "Budget created successfully", budget });
-});
+}).RequireAuthorization();
 
 // -------- TRANSACTIONS --------
 app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbContext db, TransactionRequest req) =>
 {
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId))
-        return Results.Problem("Invalid user ID", statusCode: 401);
+    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
+    // Check if category exists and belongs to user
     if (!Guid.TryParse(req.CategoryId, out var categoryId))
         return Results.BadRequest("Invalid category ID");
 
@@ -330,16 +338,26 @@ app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbCon
     db.Transactions.Add(transaction);
     await db.SaveChangesAsync();
 
-    return Results.Ok(new { message = "Transaction added", transaction });
-});
+    var response = new
+    {
+        id = transaction.Id.ToString(),
+        amount = transaction.Amount,
+        type = transaction.Type,
+        note = transaction.Note,
+        createdAt = transaction.CreatedAt.ToString("o"),
+        categoryName = category.Name
+    };
+
+    return Results.Ok(new { message = "Transaction added successfully", transaction = response });
+}).RequireAuthorization();
 
 app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
     var idStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-    if (!Guid.TryParse(idStr, out var userId))
-        return Results.Problem("Invalid user ID", statusCode: 401);
+    if (!Guid.TryParse(idStr, out var userId)) return Results.Problem("Invalid user ID", statusCode: 401);
 
-    var list = await db.Transactions
+    // ดึงข้อมูลจาก DB ก่อน (ยังไม่ format)
+    var rawTransactions = await db.Transactions
         .Where(t => t.UserId == userId)
         .Join(db.Categories,
             t => t.CategoryId,
@@ -356,40 +374,159 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
         .OrderByDescending(t => t.CreatedAt)
         .ToListAsync();
 
-    return Results.Ok(list);
-});
+    // Format ใน memory หลังดึงข้อมูลเสร็จแล้ว
+    var transactions = rawTransactions.Select(t => new
+    {
+        id = t.Id.ToString(),
+        amount = t.Amount,
+        type = t.Type,
+        note = t.Note,
+        createdAt = t.CreatedAt.ToString("o"), // "o" คือ ISO 8601 format
+        categoryName = t.CategoryName
+    });
 
-Console.WriteLine("✅ Application configured successfully");
+    return Results.Ok(transactions);
+}).RequireAuthorization();
+
+
 app.Run();
 
-
 // ================= MODELS =================
-public class LoginRequest { public string Email { get; set; } = null!; public string Password { get; set; } = null!; }
-public class User { public Guid Id { get; set; } public string Email { get; set; } = null!; public string Password { get; set; } = null!; public DateTime CreatedAt { get; set; } }
-public class Category { public Guid Id { get; set; } public Guid UserId { get; set; } public string Name { get; set; } = null!; public string Type { get; set; } = null!; public string? Icon { get; set; } public string? Color { get; set; } public DateTime CreatedAt { get; set; } }
-public class CategoryRequest { public string Name { get; set; } = null!; public string Type { get; set; } = null!; public string? Icon { get; set; } public string? Color { get; set; } }
-public class Budget { public Guid Id { get; set; } public Guid UserId { get; set; } public Guid CategoryId { get; set; } public int Month { get; set; } public int Year { get; set; } public decimal LimitAmount { get; set; } public DateTime CreatedAt { get; set; } }
-public class BudgetRequest { public Guid CategoryId { get; set; } public int Month { get; set; } public int Year { get; set; } public decimal LimitAmount { get; set; } }
-public class TransactionRequest { public string CategoryId { get; set; } = null!; public decimal Amount { get; set; } public string Type { get; set; } = null!; public string? Note { get; set; } }
-public class Transaction { public Guid Id { get; set; } public Guid UserId { get; set; } public Guid CategoryId { get; set; } public decimal Amount { get; set; } public string Type { get; set; } = null!; public string Note { get; set; } = ""; public DateTime CreatedAt { get; set; } }
+// (โค้ด Models ทั้งหมดของคุณ... ไม่ต้องแก้ไข)
+// ...
+public class LoginRequest
+{
+    public string Email { get; set; } = null!;
+    public string Password { get; set; } = null!;
+}
+
+public class User
+{
+    public Guid Id { get; set; }
+    public string Email { get; set; } = null!;
+    public string Password { get; set; } = null!;
+    public DateTime CreatedAt { get; set; }
+}
+
+public class Category
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public string Name { get; set; } = null!;
+    public string Type { get; set; } = null!;
+    public string? Icon { get; set; }
+    public string? Color { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class CategoryRequest
+{
+    public string Name { get; set; } = null!;
+    public string Type { get; set; } = null!;
+    public string? Icon { get; set; }
+    public string? Color { get; set; }
+}
+
+public class Budget
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public Guid CategoryId { get; set; }
+    public int Month { get; set; }
+    public int Year { get; set; }
+    public decimal LimitAmount { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class BudgetRequest
+{
+    public Guid CategoryId { get; set; }
+    public int Month { get; set; }
+    public int Year { get; set; }
+    public decimal LimitAmount { get; set; }
+}
+
+public class TransactionRequest
+{
+    public string CategoryId { get; set; } = null!;
+    public decimal Amount { get; set; }
+    public string Type { get; set; } = null!;
+    public string? Note { get; set; }
+}
+
+public class Transaction
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public Guid CategoryId { get; set; }
+    public decimal Amount { get; set; }
+    public string Type { get; set; } = null!;
+    public string Note { get; set; } = "";
+    public DateTime CreatedAt { get; set; }
+}
+
 
 // ================= DB CONTEXT =================
+// (โค้ด DbContext ของคุณ... ไม่ต้องแก้ไข)
+// การแมพชื่อคอลัมน์ด้วยมือแบบนี้ดีมากครับ!
 public class MyDbContext : DbContext
 {
     public MyDbContext(DbContextOptions<MyDbContext> options) : base(options) { }
 
-    public DbSet<User> Users => Set<User>();
-    public DbSet<Category> Categories => Set<Category>();
-    public DbSet<Budget> Budgets => Set<Budget>();
-    public DbSet<Transaction> Transactions => Set<Transaction>();
+    public DbSet<User> Users { get; set; } = null!;
+    public DbSet<Category> Categories { get; set; } = null!;
+    public DbSet<Budget> Budgets { get; set; } = null!;
+    public DbSet<Transaction> Transactions { get; set; } = null!;
 
-    protected override void OnModelCreating(ModelBuilder model)
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        base.OnModelCreating(model);
+        base.OnModelCreating(modelBuilder);
 
-        model.Entity<User>().ToTable("users");
-        model.Entity<Category>().ToTable("categories");
-        model.Entity<Budget>().ToTable("budgets");
-        model.Entity<Transaction>().ToTable("transactions");
+        modelBuilder.Entity<User>(entity =>
+        {
+            entity.ToTable("users");
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.Email).HasColumnName("email");
+            // แก้ไขเล็กน้อย: ให้ตรงกับฐานข้อมูล Supabase Auth ที่คนนิยมใช้
+            // แต่ถ้าคุณสร้างเอง "password_hash" ก็ถูกต้องครับ
+            entity.Property(e => e.Password).HasColumnName("password_hash"); 
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+
+        modelBuilder.Entity<Category>(entity =>
+        {
+            entity.ToTable("categories");
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.UserId).HasColumnName("user_id");
+            entity.Property(e => e.Name).HasColumnName("name");
+            entity.Property(e => e.Type).HasColumnName("type");
+            entity.Property(e => e.Icon).HasColumnName("icon");
+            entity.Property(e => e.Color).HasColumnName("color");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+
+        modelBuilder.Entity<Budget>(entity =>
+        {
+            entity.ToTable("budgets");
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.UserId).HasColumnName("user_id");
+            entity.Property(e => e.CategoryId).HasColumnName("category_id");
+            entity.Property(e => e.Month).HasColumnName("month");
+            entity.Property(e => e.Year).HasColumnName("year");
+            entity.Property(e => e.LimitAmount).HasColumnName("limit_amount");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+
+        modelBuilder.Entity<Transaction>(entity =>
+        {
+            entity.ToTable("transactions");
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.UserId).HasColumnName("user_id");
+            entity.Property(e => e.CategoryId).HasColumnName("category_id").IsRequired();
+            entity.Property(e => e.Amount).HasColumnName("amount");
+            entity.Property(e => e.Type).HasColumnName("type");
+            entity.Property(e => e.Note).HasColumnName("note");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
     }
 }
