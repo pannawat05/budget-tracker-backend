@@ -41,14 +41,19 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
-// CORS - Allow all origins for production
+// ================= CORS =================
+// สำหรับ React frontend และ production
 builder.Services.AddCors(options =>
 {
-    options.AddDefaultPolicy(policy =>
+    options.AddPolicy("BudgetAppCors", policy =>
     {
-        policy.AllowAnyOrigin()
-              .AllowAnyHeader()
-              .AllowAnyMethod();
+        policy.WithOrigins(
+            "http://localhost:5173",              // Dev React
+            "https://YOUR_PRODUCTION_FRONTEND_URL" // Production frontend
+        )
+        .AllowAnyHeader()
+        .AllowAnyMethod()
+        .AllowCredentials(); // จำเป็นเมื่อใช้ Authorization header
     });
 });
 
@@ -62,7 +67,6 @@ builder.Services.AddSwaggerGen();
 var app = builder.Build();
 
 // ================= MIDDLEWARE =================
-// Enable Swagger in all environments (for testing on Render)
 app.UseSwagger();
 app.UseSwaggerUI(c =>
 {
@@ -70,7 +74,7 @@ app.UseSwaggerUI(c =>
     c.RoutePrefix = string.Empty; // Swagger at root
 });
 
-app.UseCors();
+app.UseCors("BudgetAppCors");
 
 // Token blacklist middleware
 app.Use(async (context, next) =>
@@ -161,7 +165,7 @@ app.MapPost("/login", async (MyDbContext db, LoginRequest req) =>
 });
 
 // -------- LOGOUT --------
-app.MapPost("/logout", async (HttpContext context, IMemoryCache cache) =>
+app.MapPost("/logout", [Authorize] async (HttpContext context, IMemoryCache cache) =>
 {
     var authHeader = context.Request.Headers["Authorization"].ToString();
     if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
@@ -186,7 +190,7 @@ app.MapPost("/logout", async (HttpContext context, IMemoryCache cache) =>
     {
         return Results.Problem($"Error during logout: {ex.Message}", statusCode: 500);
     }
-}).RequireAuthorization();
+});
 
 // -------- PROFILE --------
 app.MapGet("/profile", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
@@ -213,7 +217,7 @@ app.MapGet("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext d
         .ToListAsync();
 
     return Results.Ok(categories);
-}).RequireAuthorization();
+});
 
 app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext db, CategoryRequest req) =>
 {
@@ -235,7 +239,7 @@ app.MapPost("/categories", [Authorize] async (ClaimsPrincipal user, MyDbContext 
     await db.SaveChangesAsync();
 
     return Results.Ok(new { message = "Category created successfully", category = new { category.Id, category.Name } });
-}).RequireAuthorization();
+});
 
 // -------- BUDGETS --------
 app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
@@ -250,7 +254,7 @@ app.MapGet("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db) 
         .ToListAsync();
 
     return Results.Ok(budgets);
-}).RequireAuthorization();
+});
 
 app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db, BudgetRequest req) =>
 {
@@ -276,7 +280,7 @@ app.MapPost("/budgets", [Authorize] async (ClaimsPrincipal user, MyDbContext db,
     await db.SaveChangesAsync();
 
     return Results.Ok(new { message = "Budget created successfully", budget });
-}).RequireAuthorization();
+});
 
 // -------- TRANSACTIONS --------
 app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbContext db, TransactionRequest req) =>
@@ -316,7 +320,7 @@ app.MapPost("/add-transaction", [Authorize] async (ClaimsPrincipal user, MyDbCon
     };
 
     return Results.Ok(new { message = "Transaction added successfully", transaction = response });
-}).RequireAuthorization();
+});
 
 app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext db) =>
 {
@@ -351,140 +355,7 @@ app.MapGet("/transactions", [Authorize] async (ClaimsPrincipal user, MyDbContext
     });
 
     return Results.Ok(transactions);
-}).RequireAuthorization();
+});
 
 Console.WriteLine("✅ Application configured successfully");
 app.Run();
-
-// ================= MODELS =================
-public class LoginRequest
-{
-    public string Email { get; set; } = null!;
-    public string Password { get; set; } = null!;
-}
-
-public class User
-{
-    public Guid Id { get; set; }
-    public string Email { get; set; } = null!;
-    public string Password { get; set; } = null!;
-    public DateTime CreatedAt { get; set; }
-}
-
-public class Category
-{
-    public Guid Id { get; set; }
-    public Guid UserId { get; set; }
-    public string Name { get; set; } = null!;
-    public string Type { get; set; } = null!;
-    public string? Icon { get; set; }
-    public string? Color { get; set; }
-    public DateTime CreatedAt { get; set; }
-}
-
-public class CategoryRequest
-{
-    public string Name { get; set; } = null!;
-    public string Type { get; set; } = null!;
-    public string? Icon { get; set; }
-    public string? Color { get; set; }
-}
-
-public class Budget
-{
-    public Guid Id { get; set; }
-    public Guid UserId { get; set; }
-    public Guid CategoryId { get; set; }
-    public int Month { get; set; }
-    public int Year { get; set; }
-    public decimal LimitAmount { get; set; }
-    public DateTime CreatedAt { get; set; }
-}
-
-public class BudgetRequest
-{
-    public Guid CategoryId { get; set; }
-    public int Month { get; set; }
-    public int Year { get; set; }
-    public decimal LimitAmount { get; set; }
-}
-
-public class TransactionRequest
-{
-    public string CategoryId { get; set; } = null!;
-    public decimal Amount { get; set; }
-    public string Type { get; set; } = null!;
-    public string? Note { get; set; }
-}
-
-public class Transaction
-{
-    public Guid Id { get; set; }
-    public Guid UserId { get; set; }
-    public Guid CategoryId { get; set; }
-    public decimal Amount { get; set; }
-    public string Type { get; set; } = null!;
-    public string Note { get; set; } = "";
-    public DateTime CreatedAt { get; set; }
-}
-
-// ================= DB CONTEXT =================
-public class MyDbContext : DbContext
-{
-    public MyDbContext(DbContextOptions<MyDbContext> options) : base(options) { }
-
-    public DbSet<User> Users { get; set; } = null!;
-    public DbSet<Category> Categories { get; set; } = null!;
-    public DbSet<Budget> Budgets { get; set; } = null!;
-    public DbSet<Transaction> Transactions { get; set; } = null!;
-
-    protected override void OnModelCreating(ModelBuilder modelBuilder)
-    {
-        base.OnModelCreating(modelBuilder);
-
-        modelBuilder.Entity<User>(entity =>
-        {
-            entity.ToTable("users");
-            entity.Property(e => e.Id).HasColumnName("id");
-            entity.Property(e => e.Email).HasColumnName("email");
-            entity.Property(e => e.Password).HasColumnName("password_hash");
-            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
-        });
-
-        modelBuilder.Entity<Category>(entity =>
-        {
-            entity.ToTable("categories");
-            entity.Property(e => e.Id).HasColumnName("id");
-            entity.Property(e => e.UserId).HasColumnName("user_id");
-            entity.Property(e => e.Name).HasColumnName("name");
-            entity.Property(e => e.Type).HasColumnName("type");
-            entity.Property(e => e.Icon).HasColumnName("icon");
-            entity.Property(e => e.Color).HasColumnName("color");
-            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
-        });
-
-        modelBuilder.Entity<Budget>(entity =>
-        {
-            entity.ToTable("budgets");
-            entity.Property(e => e.Id).HasColumnName("id");
-            entity.Property(e => e.UserId).HasColumnName("user_id");
-            entity.Property(e => e.CategoryId).HasColumnName("category_id");
-            entity.Property(e => e.Month).HasColumnName("month");
-            entity.Property(e => e.Year).HasColumnName("year");
-            entity.Property(e => e.LimitAmount).HasColumnName("limit_amount");
-            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
-        });
-
-        modelBuilder.Entity<Transaction>(entity =>
-        {
-            entity.ToTable("transactions");
-            entity.Property(e => e.Id).HasColumnName("id");
-            entity.Property(e => e.UserId).HasColumnName("user_id");
-            entity.Property(e => e.CategoryId).HasColumnName("category_id").IsRequired();
-            entity.Property(e => e.Amount).HasColumnName("amount");
-            entity.Property(e => e.Type).HasColumnName("type");
-            entity.Property(e => e.Note).HasColumnName("note");
-            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
-        });
-    }
-}
