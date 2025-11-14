@@ -10,25 +10,10 @@ RUN dotnet restore
 COPY . .
 RUN dotnet publish "server.csproj" -c Release -o /app/out
 
-### 1. ติดตั้ง EF Tools ไว้ในโฟลเดอร์แยก ###
-### 👇 ผมแก้ไขบรรทัดนี้ครับ (ลบ --global) 👇 ###
-RUN dotnet tool install dotnet-ef --tool-path /tools
-
-
 # --- Final Stage (ใช้ ASP.NET Runtime) ---
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app
 COPY --from=build /app/out .
 
-### 2. คัดลอก EF Tools ที่ติดตั้งไว้มาใส่ใน Image สุดท้าย ###
-COPY --from=build /tools /tools
-ENV PATH="$PATH:/tools"
-
-### 3. คัดลอก Entrypoint Script และทำให้มันทำงานได้ ###
-COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
-
-### 4. ตั้งค่าให้ Entrypoint ชี้ไปที่สคริปต์ของเรา ###
-# และ CMD คือคำสั่งปกติที่จะถูกส่งไปให้สคริปต์
-ENTRYPOINT ["/bin/bash", "entrypoint.sh"]
+# คำสั่งเริ่มต้นแอป (ไม่ต้องใช้ entrypoint แล้ว)
 CMD ["dotnet", "server.dll"]
